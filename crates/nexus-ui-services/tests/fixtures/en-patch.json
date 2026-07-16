@@ -1,0 +1,8 @@
+{
+  "Identifier": "en",
+  "DisplayName": "Ignored later display name",
+  "Texts": {
+    "hello": "Hello patched",
+    "not-a-string": 42
+  }
+}

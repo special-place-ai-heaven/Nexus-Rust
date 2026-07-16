@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Repository verification tasks for the Nexus Rust rewrite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true

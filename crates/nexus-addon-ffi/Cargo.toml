@@ -1,0 +1,20 @@
+[package]
+name = "nexus-addon-ffi"
+description = "Panic-contained native add-on API dispatch boundary for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-abi.workspace = true
+nexus-addon-api.workspace = true
+nexus-core = { path = "../nexus-core" }
+nexus-host.workspace = true
+nexus-imgui-compat.workspace = true
+thiserror.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
+
+[lints]
+workspace = true

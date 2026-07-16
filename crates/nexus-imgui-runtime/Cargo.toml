@@ -1,0 +1,15 @@
+[package]
+name = "nexus-imgui-runtime"
+description = "Rust ownership and frame lifecycle for the Nexus Dear ImGui compatibility context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-imgui-compat.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

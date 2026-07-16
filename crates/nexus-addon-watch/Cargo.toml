@@ -1,0 +1,23 @@
+[package]
+name = "nexus-addon-watch"
+description = "Bounded, stoppable Windows addon-directory change notifications for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

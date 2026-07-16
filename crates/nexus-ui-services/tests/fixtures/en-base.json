@@ -1,0 +1,8 @@
+{
+  "Identifier": "en",
+  "DisplayName": "English",
+  "Texts": {
+    "hello": "Hello",
+    "only-base": "Base"
+  }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "nexus-addon-cleanup"
+description = "Fail-closed, generation-exact addon registration cleanup for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-core.workspace = true
+nexus-data-services.workspace = true
+nexus-host.workspace = true
+nexus-inline-hooks.workspace = true
+nexus-input.workspace = true
+nexus-textures.workspace = true
+nexus-ui-host.workspace = true
+nexus-ui-services.workspace = true
+
+[lints]
+workspace = true

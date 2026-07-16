@@ -1,0 +1,23 @@
+[package]
+name = "nexus-network"
+description = "Bounded HTTP, cache, and transactional update foundations for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[lints]
+workspace = true

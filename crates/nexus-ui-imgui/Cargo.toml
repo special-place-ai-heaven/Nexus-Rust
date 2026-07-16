@@ -1,0 +1,18 @@
+[package]
+name = "nexus-ui-imgui"
+description = "Dear ImGui 1.80 backends for Nexus UI services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-imgui-compat.workspace = true
+nexus-ui-services.workspace = true
+
+[dev-dependencies]
+nexus-imgui-runtime.workspace = true
+
+[lints]
+workspace = true

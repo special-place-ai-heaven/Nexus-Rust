@@ -1,0 +1,23 @@
+[package]
+name = "nexus-textures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+nexus-abi.workspace = true
+nexus-core = { path = "../nexus-core" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "nexus-native-memory"
+description = "Fail-closed owned snapshots of add-on supplied native memory for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "nexus-textures-d3d11"
+description = "Owned D3D11 RGBA8 texture backend for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-textures = { path = "../nexus-textures" }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[lints]
+workspace = true

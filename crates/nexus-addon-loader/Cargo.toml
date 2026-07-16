@@ -1,0 +1,26 @@
+[package]
+name = "nexus-addon-loader"
+description = "Lifetime-safe Windows native add-on module loading for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-abi = { path = "../nexus-abi" }
+nexus-core = { path = "../nexus-core" }
+nexus-host = { path = "../nexus-host" }
+thiserror.workspace = true
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

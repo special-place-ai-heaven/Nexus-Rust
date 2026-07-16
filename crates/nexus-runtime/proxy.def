@@ -1,0 +1,25 @@
+LIBRARY d3d11
+EXPORTS
+    ; Immutable shipped d3d11.dll ABI (v2026.2.17.1210).
+    D3D11CoreCreateDevice              @1
+    D3D11CoreCreateLayeredDevice       @2
+    D3D11CoreGetLayeredDeviceSize      @3
+    D3D11CoreRegisterLayers            @4
+    D3D11CreateDevice                  @5
+    D3D11CreateDeviceAndSwapChain      @6
+
+    ; Source compatibility superset for alternate proxy roles.
+    Direct3DCreate9                     @7
+    Direct3DCreate9Ex                   @8
+    D3DPERF_BeginEvent                  @9
+    D3DPERF_EndEvent                    @10
+    D3DPERF_SetMarker                   @11
+    D3DPERF_SetRegion                   @12
+    D3DPERF_QueryRepeatFrame            @13
+    D3DPERF_SetOptions                  @14
+    D3DPERF_GetStatus                   @15
+    CreateDXGIFactory                   @16
+    CreateDXGIFactory1                  @17
+    CreateDXGIFactory2                  @18
+    DXGIGetDebugInterface1              @19
+    DXGIDeclareAdapterRemovalSupport    @20

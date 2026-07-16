@@ -1,0 +1,47 @@
+[package]
+name = "nexus-runtime"
+description = "Rust runtime and Windows proxy DLL for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lib]
+name = "d3d11"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nexus-abi.workspace = true
+nexus-control.workspace = true
+nexus-data-services.workspace = true
+nexus-dxgi.workspace = true
+nexus-gw2.workspace = true
+nexus-imgui-compat.workspace = true
+nexus-input.workspace = true
+nexus-input-win32.workspace = true
+nexus-network.workspace = true
+nexus-network-winhttp.workspace = true
+nexus-overlay.workspace = true
+nexus-platform.workspace = true
+nexus-render.workspace = true
+nexus-textures.workspace = true
+nexus-textures-d3d11.workspace = true
+nexus-ui-fonts.workspace = true
+nexus-ui-host.workspace = true
+nexus-ui-services.workspace = true
+thiserror.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Win32_Graphics_Direct3D11"] }
+
+[lints]
+workspace = true

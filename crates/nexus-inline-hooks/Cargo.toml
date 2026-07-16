@@ -1,0 +1,26 @@
+[package]
+name = "nexus-inline-hooks"
+description = "Owner-aware, MinHook-compatible inline hooks for the Nexus Rust runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-abi.workspace = true
+nexus-core = { path = "../nexus-core" }
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+retour = "=0.3.1"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

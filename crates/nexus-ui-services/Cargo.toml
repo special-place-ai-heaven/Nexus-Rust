@@ -1,0 +1,19 @@
+[package]
+name = "nexus-ui-services"
+description = "Owned localization, font, scaling, and style services for the Nexus Rust runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+nexus-core = { path = "../nexus-core" }
+nexus-imgui-compat.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

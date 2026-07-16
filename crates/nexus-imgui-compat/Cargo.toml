@@ -1,0 +1,14 @@
+[package]
+name = "nexus-imgui-compat"
+description = "Exact Dear ImGui 1.80 compatibility boundary for native Nexus addons"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+imgui-sys.workspace = true
+
+[lints]
+workspace = true

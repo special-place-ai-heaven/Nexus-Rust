@@ -1,0 +1,16 @@
+[package]
+name = "nexus-addon-api"
+description = "Complete typed assembly of Nexus native addon API revisions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-abi.workspace = true
+nexus-host.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

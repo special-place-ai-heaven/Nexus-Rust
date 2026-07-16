@@ -1,0 +1,14 @@
+[package]
+name = "nexus-render-d3d11"
+description = "Explicit D3D11 pipeline-state ownership and restoration for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

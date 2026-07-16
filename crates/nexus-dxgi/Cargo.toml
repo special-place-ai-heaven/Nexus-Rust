@@ -1,0 +1,25 @@
+[package]
+name = "nexus-dxgi"
+description = "Per-instance DXGI interception and swap-chain observation for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-control = { path = "../nexus-control" }
+nexus-core = { path = "../nexus-core" }
+nexus-hook = { path = "../nexus-hook" }
+nexus-render = { path = "../nexus-render" }
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+windows-sys = { workspace = true, features = [
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

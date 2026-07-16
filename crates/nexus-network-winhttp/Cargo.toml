@@ -1,0 +1,22 @@
+[package]
+name = "nexus-network-winhttp"
+description = "Synchronous bounded WinHTTP transport for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-network.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Networking_WinHttp",
+] }
+
+[lints]
+workspace = true

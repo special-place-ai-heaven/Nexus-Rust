@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Local tooling state
+/.symforge/
+/.vscode/
+/.idea/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Platform artifacts
+.DS_Store
+Thumbs.db
+*.dmp

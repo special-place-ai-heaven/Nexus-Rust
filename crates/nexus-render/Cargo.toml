@@ -1,0 +1,11 @@
+[package]
+name = "nexus-render"
+description = "GPU-independent render selection, safety, and swap-chain lifecycle policy for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

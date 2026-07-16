@@ -1,0 +1,28 @@
+[package]
+name = "nexus-overlay"
+description = "Thread-affine DXGI to Dear ImGui overlay adapter for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-control.workspace = true
+nexus-dxgi.workspace = true
+nexus-imgui-compat.workspace = true
+nexus-imgui-d3d11 = { path = "../nexus-imgui-d3d11" }
+nexus-imgui-win32 = { path = "../nexus-imgui-win32" }
+nexus-render.workspace = true
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "nexus-ui-fonts"
+description = "Legacy-compatible embedded font catalog and render-thread rebuild planning for Nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-ui-imgui = { path = "../nexus-ui-imgui" }
+nexus-ui-services = { path = "../nexus-ui-services" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select pinned Rust toolchain
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
+      - name: Build release proxy
+        run: cargo build -p nexus-runtime --release
+
+      - name: Verify proxy exports
+        run: cargo run -p xtask --release -- verify-exports target/release/d3d11.dll
+
+      - name: Smoke-test system forwarding
+        run: cargo run -p xtask --release -- smoke-proxy target/release/d3d11.dll
+
+      - name: Archive proxy
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-rust
+          path: |
+            target/release/d3d11.dll
+            target/release/d3d11.pdb
+          if-no-files-found: error

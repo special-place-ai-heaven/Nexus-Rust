@@ -1,0 +1,11 @@
+[package]
+name = "nexus-abi"
+description = "Binary-compatible public types for Nexus add-ons and shared resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

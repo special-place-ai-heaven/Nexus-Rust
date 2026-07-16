@@ -1,0 +1,15 @@
+[package]
+name = "nexus-ui-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+nexus-abi.workspace = true
+nexus-core = { path = "../nexus-core" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
