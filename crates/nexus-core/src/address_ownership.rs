@@ -1,7 +1,7 @@
-use crate::OwnerToken;
+use crate::{CallbackGate, OwnerToken};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Failure to publish a validated native module range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +16,8 @@ pub enum AddressOwnershipError {
     SignatureInUse,
     /// The same generation was republished with different bounds.
     RangeChanged,
+    /// The same generation was republished with a different callback gate.
+    CallbackGateChanged,
     /// The mapped range overlaps another live module.
     Overlap,
 }
@@ -28,6 +30,9 @@ impl fmt::Display for AddressOwnershipError {
             Self::RangeOverflow => "module address range overflowed",
             Self::SignatureInUse => "addon signature already has a mapped generation",
             Self::RangeChanged => "addon generation was republished with different bounds",
+            Self::CallbackGateChanged => {
+                "addon generation was republished with a different callback gate"
+            }
             Self::Overlap => "module address range overlaps another live module",
         })
     }
@@ -44,12 +49,12 @@ pub enum AddressPublish {
     AlreadyPresent,
 }
 
-#[derive(Clone, Copy)]
 struct Entry {
     owner: OwnerToken,
     start: usize,
     end: usize,
     accepting: bool,
+    callback_gate: Arc<CallbackGate>,
 }
 
 #[derive(Default)]
@@ -84,6 +89,7 @@ impl AddressOwnershipIndex {
         owner: OwnerToken,
         start: NonZeroUsize,
         size: usize,
+        callback_gate: Arc<CallbackGate>,
     ) -> Result<AddressPublish, AddressOwnershipError> {
         if owner.signature == 0 {
             return Err(AddressOwnershipError::ZeroSignature);
@@ -100,6 +106,9 @@ impl AddressOwnershipIndex {
         if let Some(existing) = state.entries.iter().find(|entry| entry.owner == owner) {
             if existing.start != start.get() || existing.end != end {
                 return Err(AddressOwnershipError::RangeChanged);
+            }
+            if !Arc::ptr_eq(&existing.callback_gate, &callback_gate) {
+                return Err(AddressOwnershipError::CallbackGateChanged);
             }
             return Ok(AddressPublish::AlreadyPresent);
         }
@@ -123,6 +132,7 @@ impl AddressOwnershipIndex {
             start: start.get(),
             end,
             accepting: true,
+            callback_gate,
         });
         Ok(AddressPublish::Inserted)
     }
@@ -135,6 +145,7 @@ impl AddressOwnershipIndex {
         };
         let was_accepting = entry.accepting;
         entry.accepting = false;
+        entry.callback_gate.close();
         was_accepting
     }
 
@@ -164,6 +175,19 @@ impl AddressOwnershipIndex {
             .entries
             .iter()
             .any(|entry| entry.owner == owner && entry.accepting)
+    }
+
+    /// Clones the exact host-owned callback gate for one current generation.
+    ///
+    /// Published callback wrappers retain their own clone through close and
+    /// drain; new wrappers cannot acquire the gate once admission is closed.
+    #[must_use]
+    pub fn callback_gate_for_current(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+        self.read_state()
+            .entries
+            .iter()
+            .find(|entry| entry.owner == owner && entry.accepting)
+            .map(|entry| Arc::clone(&entry.callback_gate))
     }
 
     /// Returns the number of mapped generations without exposing addresses.
@@ -200,8 +224,9 @@ impl fmt::Debug for AddressOwnershipIndex {
 #[cfg(test)]
 mod tests {
     use super::{AddressOwnershipError, AddressOwnershipIndex, AddressPublish};
-    use crate::OwnerToken;
+    use crate::{CallbackGate, OwnerToken};
     use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
     fn owner(signature: u32, generation: u64) -> OwnerToken {
         OwnerToken {
@@ -210,16 +235,27 @@ mod tests {
         }
     }
 
+    fn callback_gate() -> Arc<CallbackGate> {
+        Arc::new(CallbackGate::open())
+    }
+
     #[test]
     fn close_rejects_new_calls_but_keeps_mapping_until_retirement() {
         let index = AddressOwnershipIndex::new();
         let owner = owner(17, 1);
         let start = NonZeroUsize::new(0x1_0000).expect("fixture address is non-zero");
+        let gate = callback_gate();
 
         assert_eq!(
-            index.publish(owner, start, 0x1000),
+            index.publish(owner, start, 0x1000, Arc::clone(&gate)),
             Ok(AddressPublish::Inserted)
         );
+        assert!(Arc::ptr_eq(
+            &index
+                .callback_gate_for_current(owner)
+                .expect("gate should be published"),
+            &gate
+        ));
         assert_eq!(
             index.owner_for_address(NonZeroUsize::new(0x1_0fff).expect("non-zero")),
             Some(owner)
@@ -227,10 +263,12 @@ mod tests {
         assert!(index.is_current_owner(owner));
 
         assert!(index.close(owner));
+        assert!(!gate.is_open());
+        assert!(index.callback_gate_for_current(owner).is_none());
         assert_eq!(index.owner_for_address(start), Some(owner));
         assert!(!index.is_current_owner(owner));
         assert_eq!(
-            index.publish(owner, start, 0x1000),
+            index.publish(owner, start, 0x1000, Arc::clone(&gate)),
             Ok(AddressPublish::AlreadyPresent)
         );
         assert!(!index.is_current_owner(owner));
@@ -245,18 +283,20 @@ mod tests {
         let second = owner(17, 2);
         let first_start = NonZeroUsize::new(0x1_0000).expect("non-zero");
         let second_start = NonZeroUsize::new(0x2_0000).expect("non-zero");
+        let first_gate = callback_gate();
+        let second_gate = callback_gate();
 
         assert_eq!(
-            index.publish(first, first_start, 0x1000),
+            index.publish(first, first_start, 0x1000, first_gate),
             Ok(AddressPublish::Inserted)
         );
         assert_eq!(
-            index.publish(second, second_start, 0x1000),
+            index.publish(second, second_start, 0x1000, Arc::clone(&second_gate)),
             Err(AddressOwnershipError::SignatureInUse)
         );
         assert!(index.retire(first));
         assert_eq!(
-            index.publish(second, second_start, 0x1000),
+            index.publish(second, second_start, 0x1000, Arc::clone(&second_gate)),
             Ok(AddressPublish::Inserted)
         );
         assert!(!index.close(first));
@@ -270,24 +310,30 @@ mod tests {
         let first = owner(17, 1);
         let other = owner(23, 1);
         let start = NonZeroUsize::new(0x1_0000).expect("non-zero");
+        let first_gate = callback_gate();
 
         assert_eq!(
-            index.publish(first, start, 0x1000),
+            index.publish(first, start, 0x1000, Arc::clone(&first_gate)),
             Ok(AddressPublish::Inserted)
         );
         assert_eq!(
-            index.publish(first, start, 0x1000),
+            index.publish(first, start, 0x1000, Arc::clone(&first_gate)),
             Ok(AddressPublish::AlreadyPresent)
         );
         assert_eq!(
-            index.publish(first, start, 0x2000),
+            index.publish(first, start, 0x2000, Arc::clone(&first_gate)),
             Err(AddressOwnershipError::RangeChanged)
+        );
+        assert_eq!(
+            index.publish(first, start, 0x1000, callback_gate()),
+            Err(AddressOwnershipError::CallbackGateChanged)
         );
         assert_eq!(
             index.publish(
                 other,
                 NonZeroUsize::new(0x1_0800).expect("non-zero"),
                 0x1000,
+                callback_gate(),
             ),
             Err(AddressOwnershipError::Overlap)
         );

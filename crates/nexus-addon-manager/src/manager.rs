@@ -1045,7 +1045,18 @@ impl<P: LoaderPlatform, C: RegistrationCleaner> AddonManager<P, C> {
             }
         };
 
-        if let Err(error) = self.ownership.publish(owner, range.start(), range.len()) {
+        let callback_gate = match self.host.callback_gate(owner) {
+            Ok(callback_gate) => callback_gate,
+            Err(error) => {
+                let _ = self.host.cancel_discovery(owner);
+                self.release_rejected_module(&key, module, state)?;
+                return Err(ManagerError::Host(error.into()));
+            }
+        };
+        if let Err(error) = self
+            .ownership
+            .publish(owner, range.start(), range.len(), callback_gate)
+        {
             let host_result = self
                 .host
                 .cancel_discovery(owner)

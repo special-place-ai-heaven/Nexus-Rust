@@ -30,7 +30,7 @@ use nexus_addon_manager::{
     ManagerRuntime, ManagerState, ModuleAddressRange, ModuleAddressResolver, PolicyReason,
     RegistrationCleaner, UninstallTiming, UnloadReason, UpdateTiming,
 };
-use nexus_core::{AddressOwnershipIndex, OwnerToken};
+use nexus_core::{AddressOwnershipIndex, CallbackGate, OwnerToken};
 use nexus_host::{ApiTableCatalog, ApiTables, MetadataLimits, ModuleMemory, ModuleReadError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,6 +442,7 @@ fn ownership_publication_failure_rolls_back_discovery_and_allows_clean_retry() {
             blocker,
             fixture.resolver.0.start(),
             fixture.resolver.0.len(),
+            Arc::new(CallbackGate::open()),
         )
         .expect("blocking fixture range should publish");
     let mut manager =
