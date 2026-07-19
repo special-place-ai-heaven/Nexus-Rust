@@ -404,6 +404,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex, MutexGuard, OnceLock, Weak};
 
+    use nexus_core::CallbackGate;
+
     use super::*;
 
     #[derive(Default)]
@@ -593,7 +595,7 @@ mod tests {
         let owner = owner(71, 3);
         let hint = address(0x7_1000);
         index
-            .publish(owner, hint, 0x1000)
+            .publish(owner, hint, 0x1000, Arc::new(CallbackGate::open()))
             .expect("fixture range should publish");
         let resolver = AddonCallerResolver::new(index.clone());
 
