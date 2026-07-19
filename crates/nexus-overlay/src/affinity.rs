@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+#[cfg(test)]
+use std::sync::Weak;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, ThreadId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,8 +15,16 @@ pub(crate) enum AffinityStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AffinityClaimError {
     Foreign,
+    Busy,
+    StaleProof,
     Exhausted,
     InvalidState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AffinityProof {
+    generation: u64,
+    present_sequence: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -22,6 +32,7 @@ pub(crate) struct ThreadAffinity {
     inner: Arc<AffinityInner>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct WeakThreadAffinity {
     inner: Weak<AffinityInner>,
@@ -36,6 +47,7 @@ struct AffinityInner {
 struct AffinityState {
     owner: Option<AffinityOwner>,
     next_token: u64,
+    latest_proof: Option<AffinityProof>,
 }
 
 #[derive(Debug)]
@@ -44,6 +56,7 @@ struct AffinityOwner {
     token: u64,
     claims: usize,
     leases: usize,
+    guards: usize,
 }
 
 #[must_use = "dropping an uncommitted affinity claim releases its provisional ownership"]
@@ -64,36 +77,112 @@ pub(crate) struct ThreadAffinityLease {
     _thread_bound: PhantomData<Rc<()>>,
 }
 
+#[must_use = "the affinity guard must span the complete native callback"]
+pub(crate) struct ThreadAffinityGuard {
+    inner: Arc<AffinityInner>,
+    thread: ThreadId,
+    token: u64,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl AffinityProof {
+    /// Identifies one classifier-approved Present in the selected chain's
+    /// monotonic resource generation and callback sequence.
+    pub(crate) const fn new(generation: u64, present_sequence: u64) -> Self {
+        Self {
+            generation,
+            present_sequence,
+        }
+    }
+
+    fn is_strictly_after(self, other: Self) -> bool {
+        self.generation >= other.generation && self.present_sequence > other.present_sequence
+    }
+}
+
 impl ThreadAffinity {
+    #[cfg(test)]
     pub(crate) fn downgrade(&self) -> WeakThreadAffinity {
         WeakThreadAffinity {
             inner: Arc::downgrade(&self.inner),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_claim(&self) -> Result<ThreadAffinityClaim, AffinityClaimError> {
+        self.begin_claim_with_proof(None)
+    }
+
+    pub(crate) fn begin_present_claim(
+        &self,
+        proof: AffinityProof,
+    ) -> Result<ThreadAffinityClaim, AffinityClaimError> {
+        // A foreign caller may rotate only a dormant epoch. Live claims and
+        // guards are the cooperative acknowledgement that its owner is still
+        // inside native work; leases alone deliberately permit handoff because
+        // their TLS resources remain dormant and token-revoked.
+        self.begin_claim_with_proof(Some(proof))
+    }
+
+    fn begin_claim_with_proof(
+        &self,
+        proof: Option<AffinityProof>,
+    ) -> Result<ThreadAffinityClaim, AffinityClaimError> {
         let current = thread::current().id();
         let mut state = recover(&self.inner.state);
+        if let Some(proof) = proof
+            && state
+                .latest_proof
+                .is_some_and(|latest| !proof.is_strictly_after(latest))
+        {
+            return Err(AffinityClaimError::StaleProof);
+        }
         let token = match state.owner.as_mut() {
             Some(owner) if owner.thread == current => {
-                owner.claims = owner
+                let claims = owner
                     .claims
                     .checked_add(1)
                     .ok_or(AffinityClaimError::Exhausted)?;
+                owner.claims = claims;
                 owner.token
             }
-            Some(_) => return Err(AffinityClaimError::Foreign),
-            None => {
-                let token = next_token(&mut state.next_token);
+            Some(owner) => {
+                if proof.is_none() {
+                    return Err(AffinityClaimError::Foreign);
+                }
+                if owner.claims != 0 || owner.guards != 0 {
+                    return Err(AffinityClaimError::Busy);
+                }
+
+                let token = next_token(&mut state.next_token)?;
                 state.owner = Some(AffinityOwner {
                     thread: current,
                     token,
                     claims: 1,
                     leases: 0,
+                    guards: 0,
+                });
+                token
+            }
+            None => {
+                if proof.is_none() && state.latest_proof.is_some() {
+                    return Err(AffinityClaimError::Foreign);
+                }
+                let token = next_token(&mut state.next_token)?;
+                state.owner = Some(AffinityOwner {
+                    thread: current,
+                    token,
+                    claims: 1,
+                    leases: 0,
+                    guards: 0,
                 });
                 token
             }
         };
+        if let Some(proof) = proof {
+            state.latest_proof = Some(proof);
+        }
         drop(state);
 
         Ok(ThreadAffinityClaim {
@@ -115,6 +204,7 @@ impl ThreadAffinity {
     }
 }
 
+#[cfg(test)]
 impl WeakThreadAffinity {
     pub(crate) fn upgrade(&self) -> Option<ThreadAffinity> {
         self.inner.upgrade().map(|inner| ThreadAffinity { inner })
@@ -126,7 +216,27 @@ impl WeakThreadAffinity {
 }
 
 impl ThreadAffinityClaim {
+    #[cfg(test)]
     pub(crate) fn commit(mut self) -> Result<ThreadAffinityLease, AffinityClaimError> {
+        let (lease, guard) = self.commit_inner(false)?;
+        debug_assert!(guard.is_none(), "unguarded commit cannot create a guard");
+        Ok(lease)
+    }
+
+    pub(crate) fn commit_guarded(
+        mut self,
+    ) -> Result<(ThreadAffinityLease, ThreadAffinityGuard), AffinityClaimError> {
+        let (lease, guard) = self.commit_inner(true)?;
+        let Some(guard) = guard else {
+            return Err(AffinityClaimError::InvalidState);
+        };
+        Ok((lease, guard))
+    }
+
+    fn commit_inner(
+        &mut self,
+        guarded: bool,
+    ) -> Result<(ThreadAffinityLease, Option<ThreadAffinityGuard>), AffinityClaimError> {
         let mut state = recover(&self.inner.state);
         let Some(owner) = state
             .owner
@@ -144,18 +254,47 @@ impl ThreadAffinityClaim {
             drop(state);
             return Err(AffinityClaimError::Exhausted);
         };
+        let guards = if guarded {
+            Some(
+                owner
+                    .guards
+                    .checked_add(1)
+                    .ok_or(AffinityClaimError::Exhausted)?,
+            )
+        } else {
+            None
+        };
         owner.claims = claims;
         owner.leases = leases;
+        if let Some(guards) = guards {
+            owner.guards = guards;
+        }
         self.active = false;
         drop(state);
 
-        Ok(ThreadAffinityLease {
+        let lease = ThreadAffinityLease {
             inner: Arc::clone(&self.inner),
             thread: self.thread,
             token: self.token,
             active: true,
             _thread_bound: PhantomData,
-        })
+        };
+        let guard = guarded.then(|| ThreadAffinityGuard {
+            inner: Arc::clone(&self.inner),
+            thread: self.thread,
+            token: self.token,
+            active: true,
+            _thread_bound: PhantomData,
+        });
+        Ok((lease, guard))
+    }
+}
+
+impl ThreadAffinityLease {
+    pub(crate) fn shares_epoch(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+            && self.thread == other.thread
+            && self.token == other.token
     }
 }
 
@@ -177,12 +316,22 @@ impl Drop for ThreadAffinityLease {
     }
 }
 
-fn next_token(next: &mut u64) -> u64 {
-    *next = next.wrapping_add(1);
-    if *next == 0 {
-        *next = 1;
+impl Drop for ThreadAffinityGuard {
+    fn drop(&mut self) {
+        if self.active {
+            release_guard(&self.inner, self.thread, self.token);
+            self.active = false;
+        }
     }
-    *next
+}
+
+fn next_token(next: &mut u64) -> Result<u64, AffinityClaimError> {
+    let token = next
+        .checked_add(1)
+        .filter(|token| *token != 0)
+        .ok_or(AffinityClaimError::Exhausted)?;
+    *next = token;
+    Ok(token)
 }
 
 fn release_claim(inner: &AffinityInner, thread: ThreadId, token: u64) {
@@ -219,11 +368,28 @@ fn release_lease(inner: &AffinityInner, thread: ThreadId, token: u64) {
     clear_released_owner(&mut state);
 }
 
+fn release_guard(inner: &AffinityInner, thread: ThreadId, token: u64) {
+    let mut state = recover(&inner.state);
+    let Some(owner) = state
+        .owner
+        .as_mut()
+        .filter(|owner| owner.thread == thread && owner.token == token)
+    else {
+        return;
+    };
+    let Some(guards) = owner.guards.checked_sub(1) else {
+        debug_assert!(false, "an active guard must be registered");
+        return;
+    };
+    owner.guards = guards;
+    clear_released_owner(&mut state);
+}
+
 fn clear_released_owner(state: &mut AffinityState) {
     if state
         .owner
         .as_ref()
-        .is_some_and(|owner| owner.claims == 0 && owner.leases == 0)
+        .is_some_and(|owner| owner.claims == 0 && owner.leases == 0 && owner.guards == 0)
     {
         state.owner = None;
     }
@@ -239,7 +405,17 @@ fn recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::sync::{Arc, Barrier};
 
-    use super::{AffinityClaimError, AffinityStatus, ThreadAffinity};
+    use super::{AffinityClaimError, AffinityProof, AffinityStatus, ThreadAffinity};
+
+    #[test]
+    fn token_exhaustion_fails_closed_without_aba_reuse() {
+        let mut token = u64::MAX;
+        assert_eq!(
+            super::next_token(&mut token),
+            Err(AffinityClaimError::Exhausted)
+        );
+        assert_eq!(token, u64::MAX);
+    }
 
     #[test]
     fn committed_lease_owns_only_for_its_exact_lifetime() {
@@ -430,6 +606,144 @@ mod tests {
         .expect("later owner should exit normally");
         assert_eq!(reclaimed, AffinityStatus::Owner);
         assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn newer_present_rotates_a_quiescent_foreign_epoch() {
+        let affinity = Arc::new(ThreadAffinity::default());
+        let (old_lease, old_guard) = affinity
+            .begin_present_claim(AffinityProof::new(3, 10))
+            .expect("initial present should claim affinity")
+            .commit_guarded()
+            .expect("initial present should commit a guarded lease");
+        drop(old_guard);
+
+        let migrated = Arc::clone(&affinity);
+        assert!(
+            std::thread::spawn(move || {
+                let (lease, guard) = migrated
+                    .begin_present_claim(AffinityProof::new(3, 11))
+                    .expect("newer foreign present should rotate a quiescent epoch")
+                    .commit_guarded()
+                    .expect("migrated present should commit a guarded lease");
+                let owned = migrated.status() == AffinityStatus::Owner;
+                drop(guard);
+                drop(lease);
+                owned
+            })
+            .join()
+            .expect("migration thread should finish")
+        );
+
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+        let stale = Arc::clone(&affinity);
+        assert!(
+            std::thread::spawn(move || matches!(
+                stale.begin_present_claim(AffinityProof::new(3, 11)),
+                Err(AffinityClaimError::StaleProof)
+            ))
+            .join()
+            .expect("stale callback thread should finish")
+        );
+        let replacement = affinity
+            .begin_present_claim(AffinityProof::new(3, 12))
+            .expect("later present should claim a fresh epoch")
+            .commit()
+            .expect("later present should commit its lease");
+        assert!(!old_lease.shares_epoch(&replacement));
+        drop(old_lease);
+        assert_eq!(affinity.status(), AffinityStatus::Owner);
+        drop(replacement);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn live_guard_defers_a_newer_foreign_present() {
+        let affinity = Arc::new(ThreadAffinity::default());
+        let (old_lease, old_guard) = affinity
+            .begin_present_claim(AffinityProof::new(5, 20))
+            .expect("initial present should claim affinity")
+            .commit_guarded()
+            .expect("initial present should commit a guarded lease");
+
+        let blocked = Arc::clone(&affinity);
+        assert!(
+            std::thread::spawn(move || matches!(
+                blocked.begin_present_claim(AffinityProof::new(5, 21)),
+                Err(AffinityClaimError::Busy)
+            ))
+            .join()
+            .expect("blocked migration thread should finish")
+        );
+
+        drop(old_guard);
+        let migrated = Arc::clone(&affinity);
+        assert!(
+            std::thread::spawn(move || {
+                let Ok((lease, guard)) = migrated
+                    .begin_present_claim(AffinityProof::new(5, 22))
+                    .and_then(|claim| claim.commit_guarded())
+                else {
+                    return false;
+                };
+                drop(guard);
+                drop(lease);
+                true
+            })
+            .join()
+            .expect("later migration thread should finish")
+        );
+        drop(old_lease);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn live_provisional_claim_defers_handoff() {
+        let affinity = Arc::new(ThreadAffinity::default());
+        let provisional = affinity
+            .begin_present_claim(AffinityProof::new(7, 30))
+            .expect("initial present should claim affinity");
+
+        let blocked = Arc::clone(&affinity);
+        assert!(
+            std::thread::spawn(move || matches!(
+                blocked.begin_present_claim(AffinityProof::new(7, 31)),
+                Err(AffinityClaimError::Busy)
+            ))
+            .join()
+            .expect("blocked handoff thread should finish")
+        );
+        drop(provisional);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn stale_or_regressed_proof_cannot_rotate_an_epoch() {
+        let affinity = Arc::new(ThreadAffinity::default());
+        let lease = affinity
+            .begin_present_claim(AffinityProof::new(9, 40))
+            .expect("initial present should claim affinity")
+            .commit()
+            .expect("initial present should commit its lease");
+
+        for proof in [
+            AffinityProof::new(9, 40),
+            AffinityProof::new(9, 39),
+            AffinityProof::new(8, 41),
+        ] {
+            let stale = Arc::clone(&affinity);
+            assert!(
+                std::thread::spawn(move || matches!(
+                    stale.begin_present_claim(proof),
+                    Err(AffinityClaimError::StaleProof)
+                ))
+                .join()
+                .expect("stale proof thread should finish")
+            );
+        }
+
+        assert_eq!(affinity.status(), AffinityStatus::Owner);
+        drop(lease);
     }
 
     #[test]

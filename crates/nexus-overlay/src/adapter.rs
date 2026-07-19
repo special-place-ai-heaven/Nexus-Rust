@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
 use nexus_dxgi::{
@@ -20,8 +20,8 @@ use windows::core::Interface;
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::affinity::{
-    AffinityClaimError, AffinityStatus, ThreadAffinity, ThreadAffinityClaim, ThreadAffinityLease,
-    WeakThreadAffinity,
+    AffinityClaimError, AffinityProof, AffinityStatus, ThreadAffinity, ThreadAffinityClaim,
+    ThreadAffinityLease,
 };
 use crate::message_queue::WindowTarget;
 use crate::signal::{NoopShutdownSignal, ShutdownSignal};
@@ -235,7 +235,9 @@ pub struct OverlayAdapter {
     builder: Arc<dyn UiFrameBuilder>,
     observer: Arc<dyn RenderSessionObserver>,
     target: Arc<WindowTarget>,
-    affinities: Mutex<HashMap<u64, WeakThreadAffinity>>,
+    affinities: Mutex<HashMap<u64, ThreadAffinity>>,
+    active_session: Mutex<Option<RenderSessionIdentity>>,
+    operation_gate: Mutex<()>,
 }
 
 impl OverlayAdapter {
@@ -284,6 +286,8 @@ impl OverlayAdapter {
             observer,
             target: Arc::new(WindowTarget::with_router(true, shutdown, router)),
             affinities: Mutex::new(HashMap::new()),
+            active_session: Mutex::new(None),
+            operation_gate: Mutex::new(()),
         }
     }
 
@@ -310,66 +314,101 @@ impl OverlayAdapter {
     /// that thread next enters the subclass or render callback.
     pub fn deactivate(&self) {
         self.target.deactivate();
+        *recover_mutex(&self.active_session) = None;
         retire_thread_state(self.id);
         self.target.request_thread_cleanup();
     }
 
+    #[cfg(test)]
     fn claim_affinity(
         &self,
         swap_chain: SwapChainId,
     ) -> Result<ThreadAffinityClaim, AffinityClaimError> {
+        self.affinity(swap_chain).begin_claim()
+    }
+
+    fn claim_present_affinity(
+        &self,
+        swap_chain: SwapChainId,
+        generation: u64,
+        present_sequence: u64,
+    ) -> Result<ThreadAffinityClaim, AffinityClaimError> {
+        self.affinity(swap_chain)
+            .begin_present_claim(AffinityProof::new(generation, present_sequence))
+    }
+
+    fn affinity(&self, swap_chain: SwapChainId) -> ThreadAffinity {
         let mut affinities = recover_mutex(&self.affinities);
-        affinities.retain(|_, affinity| affinity.is_alive());
-        let affinity = affinities
-            .get(&swap_chain.get())
-            .and_then(WeakThreadAffinity::upgrade)
-            .unwrap_or_else(|| {
-                let affinity = ThreadAffinity::default();
-                affinities.insert(swap_chain.get(), affinity.downgrade());
-                affinity
-            });
-        let claim = affinity.begin_claim();
-        drop(affinities);
-        claim
+        affinities.entry(swap_chain.get()).or_default().clone()
     }
 
     fn affinity_status(&self, swap_chain: SwapChainId) -> AffinityStatus {
-        let mut affinities = recover_mutex(&self.affinities);
-        let Some(affinity) = affinities
+        let affinity = recover_mutex(&self.affinities)
             .get(&swap_chain.get())
-            .and_then(WeakThreadAffinity::upgrade)
-        else {
-            affinities.remove(&swap_chain.get());
-            return AffinityStatus::Unclaimed;
-        };
-        affinity.status()
+            .cloned();
+        affinity.map_or(AffinityStatus::Unclaimed, |affinity| affinity.status())
+    }
+
+    fn record_render_success(&self, identity: RenderSessionIdentity) {
+        let mut active = recover_mutex(&self.active_session);
+        if self.target.is_active()
+            && active.as_ref().is_none_or(|current| {
+                identity.latest_present_sequence > current.latest_present_sequence
+            })
+        {
+            *active = Some(identity);
+        }
+    }
+
+    fn retire_active_session(&self, retirement: SwapChainRetirement) -> bool {
+        let mut active = recover_mutex(&self.active_session);
+        if active
+            .as_ref()
+            .is_some_and(|identity| identity.is_retired_by(retirement))
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_operation(&self) -> Result<MutexGuard<'_, ()>, RenderCallbackError> {
+        match self.operation_gate.try_lock() {
+            Ok(operation) => Ok(operation),
+            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => Err(invalid_state(RenderOperation::PrepareTarget)),
+        }
     }
 
     fn render_owned(&self, frame: &PresentFrame<'_>) -> Result<(), RenderCallbackError> {
         ensure_target_active(&self.target)?;
-        let affinity_claim = self
-            .claim_affinity(frame.id())
-            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
+        let _operation = self.try_operation()?;
+        ensure_target_active(&self.target)?;
 
         let generation = frame.generation().get();
         let present_sequence = frame.sequence();
         let swap_chain_id = frame.id();
+        let affinity_claim = self
+            .claim_present_affinity(swap_chain_id, generation, present_sequence)
+            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
+        let (affinity_lease, _affinity_guard) = affinity_claim
+            .commit_guarded()
+            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
         self.target.select_swap_chain(swap_chain_id.get());
 
-        THREAD_STATES
+        let rendered = THREAD_STATES
             .try_with(move |states| {
                 let mut states = states
                     .try_borrow_mut()
                     .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
-                let replace = states
-                    .get(&self.id)
-                    .is_none_or(|state| !state.identity.matches(swap_chain_id, generation));
+                let replace = states.get(&self.id).is_none_or(|state| {
+                    !state.identity.matches(swap_chain_id, generation)
+                        || !state._affinity_lease.shares_epoch(&affinity_lease)
+                });
                 if replace {
                     states.remove(&self.id);
                     self.target.reset();
-                    let affinity_lease = affinity_claim
-                        .commit()
-                        .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
                     let identity =
                         RenderSessionIdentity::new(swap_chain_id, generation, present_sequence);
                     let state = RenderThreadState::attach(
@@ -396,13 +435,13 @@ impl OverlayAdapter {
                         || self.target.reset(),
                     )
                 } else {
-                    // The state already holds the one or more exact committed
-                    // leases that own this adapter. This frame's reentrant
-                    // claim is provisional only and must not extend ownership.
-                    drop(affinity_claim);
                     let state = states
                         .get_mut(&self.id)
                         .ok_or_else(|| invalid_state(RenderOperation::PrepareTarget))?;
+                    // Renew the exact lease while the guarded claim prevents a
+                    // handoff. The replaced lease has this same epoch, so its
+                    // drop balances the extra lease committed for this frame.
+                    state._affinity_lease = affinity_lease;
                     state.identity.observe_present(present_sequence);
                     state.render(
                         generation,
@@ -412,7 +451,15 @@ impl OverlayAdapter {
                     )
                 }
             })
-            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?
+            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
+        if rendered.is_ok() {
+            self.record_render_success(RenderSessionIdentity::new(
+                swap_chain_id,
+                generation,
+                present_sequence,
+            ));
+        }
+        rendered
     }
 
     fn mark_resize(
@@ -426,11 +473,22 @@ impl OverlayAdapter {
         if !self.target.is_selected_swap_chain(frame.id().get()) {
             return Ok(());
         }
-        match self.affinity_status(frame.id()) {
-            AffinityStatus::Unclaimed => return Ok(()),
-            AffinityStatus::Foreign => {
-                return Err(invalid_state(RenderOperation::PrepareTarget));
-            }
+        self.mark_selected_resize(frame.id(), phase)
+    }
+
+    fn mark_selected_resize(
+        &self,
+        swap_chain: SwapChainId,
+        phase: ResizePhase,
+    ) -> Result<(), RenderCallbackError> {
+        // Resize callbacks are advisory around native ResizeBuffers. A busy
+        // callback or a foreign owner must remain a fail-open no-op; the next
+        // selected Present reconciles the resource generation.
+        let Ok(_operation) = self.try_operation() else {
+            return Ok(());
+        };
+        match self.affinity_status(swap_chain) {
+            AffinityStatus::Unclaimed | AffinityStatus::Foreign => return Ok(()),
             AffinityStatus::Owner => {}
         }
         THREAD_STATES
@@ -439,7 +497,7 @@ impl OverlayAdapter {
                     .try_borrow_mut()
                     .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
                 if let Some(state) = states.get_mut(&self.id)
-                    && state.identity.swap_chain_id == frame.id()
+                    && state.identity.swap_chain_id == swap_chain
                 {
                     state.resize_phase = phase;
                 }
@@ -466,12 +524,15 @@ impl OverlayRenderer for OverlayAdapter {
         &self,
         retirement: SwapChainRetirement,
     ) -> Result<(), RenderCallbackError> {
-        let retired = retire_current_thread_state(self.id, retirement)?;
-        if retired {
-            // Retirement is a fail-open boundary: stale capture intent must
-            // never survive after this chain stops being render-selected.
+        let _operation = self.try_operation()?;
+        if self.retire_active_session(retirement) {
+            // Capture belongs to the process-wide exact active identity, not
+            // whichever TLS happens to receive this retirement. A current
+            // foreign retirement must clear it, while a stale local retirement
+            // must leave a newer migrated session untouched.
             self.target.set_capture(false, false);
         }
+        let _ = retire_current_thread_state(self.id, retirement)?;
         Ok(())
     }
 }
@@ -689,8 +750,11 @@ impl RenderThreadState {
             }
         };
         ensure_target_active(target)?;
+        if let Err(error) = built {
+            target.set_capture(false, false);
+            return Err(error);
+        }
         target.set_capture(capture_mouse, capture_keyboard);
-        built?;
 
         let completed = self.renderer.with_current_context(|context| {
             panic::catch_unwind(AssertUnwindSafe(|| builder.after_render(context, stage)))
@@ -941,8 +1005,9 @@ mod tests {
 
     use super::{
         NoopRenderSessionObserver, NoopUiFrameBuilder, OverlayAdapter, RenderSessionIdentity,
-        RenderSessionObserver, RenderSessionResources, UiFrameBuilder, UiFramePreparation,
-        next_adapter_id, publish_after_first_success, remove_matching_entry, render_operation,
+        RenderSessionObserver, RenderSessionResources, ResizePhase, UiFrameBuilder,
+        UiFramePreparation, next_adapter_id, publish_after_first_success, remove_matching_entry,
+        render_operation,
     };
 
     struct LeaseBackedState {
@@ -972,6 +1037,91 @@ mod tests {
     #[test]
     fn process_adapter_is_send_sync_without_native_state() {
         assert_send_sync::<OverlayAdapter>();
+    }
+
+    #[test]
+    fn adapter_operation_gate_is_exclusive_and_nonblocking() {
+        let adapter = Arc::new(OverlayAdapter::new(Arc::new(NoopUiFrameBuilder)));
+        let operation = adapter
+            .try_operation()
+            .expect("initial callback should own the operation gate");
+        let contended = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || contended.try_operation().is_err())
+                .join()
+                .expect("contending callback thread should finish")
+        );
+        drop(operation);
+        assert!(adapter.try_operation().is_ok());
+    }
+
+    #[test]
+    fn adapter_keeps_present_high_water_after_an_epoch_quiesces() {
+        let adapter = Arc::new(OverlayAdapter::new(Arc::new(NoopUiFrameBuilder)));
+        let swap_chain = SwapChainId::new(26);
+        let (lease, guard) = adapter
+            .claim_present_affinity(swap_chain, 4, 20)
+            .expect("initial present should claim affinity")
+            .commit_guarded()
+            .expect("initial present should commit its epoch");
+        drop(guard);
+        drop(lease);
+
+        let stale = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || matches!(
+                stale.claim_present_affinity(swap_chain, 4, 20),
+                Err(AffinityClaimError::StaleProof)
+            ))
+            .join()
+            .expect("stale callback thread should finish")
+        );
+
+        let current = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || {
+                let Ok((lease, guard)) = current
+                    .claim_present_affinity(swap_chain, 4, 21)
+                    .and_then(|claim| claim.commit_guarded())
+                else {
+                    return false;
+                };
+                drop(guard);
+                drop(lease);
+                true
+            })
+            .join()
+            .expect("newer callback thread should finish")
+        );
+    }
+
+    #[test]
+    fn retirement_capture_follows_the_global_exact_identity() {
+        let adapter = Arc::new(OverlayAdapter::new(Arc::new(NoopUiFrameBuilder)));
+        let swap_chain = SwapChainId::new(27);
+        let generation = nexus_render::SessionGeneration::FIRST;
+        adapter.set_visible(true);
+        adapter.target.set_capture(true, true);
+        adapter.record_render_success(RenderSessionIdentity::new(swap_chain, generation.get(), 31));
+
+        nexus_dxgi::OverlayRenderer::retire_swap_chain(
+            adapter.as_ref(),
+            SwapChainRetirement::new(swap_chain, generation, 30),
+        )
+        .expect("stale retirement should remain a no-op");
+        assert!(adapter.target.should_consume(0x0100));
+
+        let retiring = Arc::clone(&adapter);
+        std::thread::spawn(move || {
+            nexus_dxgi::OverlayRenderer::retire_swap_chain(
+                retiring.as_ref(),
+                SwapChainRetirement::new(swap_chain, generation, 31),
+            )
+        })
+        .join()
+        .expect("foreign retirement thread should finish")
+        .expect("current foreign retirement should succeed");
+        assert!(!adapter.target.should_consume(0x0100));
     }
 
     #[test]
@@ -1033,6 +1183,42 @@ mod tests {
             .join()
             .expect("reclaimed affinity thread should finish")
         );
+    }
+
+    #[test]
+    fn foreign_resize_is_fail_open_before_a_proven_handoff() {
+        let adapter = Arc::new(OverlayAdapter::new(Arc::new(NoopUiFrameBuilder)));
+        let swap_chain = SwapChainId::new(25);
+        adapter.target.select_swap_chain(swap_chain.get());
+        let (old_lease, old_guard) = adapter
+            .claim_present_affinity(swap_chain, 3, 10)
+            .expect("initial present should claim affinity")
+            .commit_guarded()
+            .expect("initial present should commit a guarded lease");
+        drop(old_guard);
+
+        let migrated = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || {
+                migrated
+                    .mark_selected_resize(swap_chain, ResizePhase::Begun)
+                    .expect("foreign resize should remain a fail-open no-op");
+                let (lease, guard) = migrated
+                    .claim_present_affinity(swap_chain, 3, 11)
+                    .expect("newer present should rotate the quiescent epoch")
+                    .commit_guarded()
+                    .expect("migrated present should commit its epoch");
+                drop(guard);
+                let owner_resize = migrated
+                    .mark_selected_resize(swap_chain, ResizePhase::Completed)
+                    .is_ok();
+                drop(lease);
+                owner_resize
+            })
+            .join()
+            .expect("migration thread should finish")
+        );
+        drop(old_lease);
     }
 
     #[test]

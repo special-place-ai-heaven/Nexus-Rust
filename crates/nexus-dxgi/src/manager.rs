@@ -308,6 +308,10 @@ impl Inner {
 
     pub(crate) fn report_panic(&self, boundary: Boundary) {
         self.emit_observation(DxgiObservationEvent::PanicContained { boundary });
+        // A panicking render-lane owner releases its lease during unwinding.
+        // Recover any cleanup queued by a concurrently closing callback before
+        // the permanently closed callback gate can strand it.
+        self.drain_deferred_retirements_if_available();
     }
 
     pub(crate) fn report_attach_error(
@@ -374,8 +378,48 @@ impl Inner {
         let key = pointer as usize;
         let state = {
             let mut policy = lock(&self.policy);
-            policy.sequence = policy.sequence.saturating_add(1);
-            let sequence = policy.sequence;
+            if self.is_closing() {
+                drop(policy);
+                self.finish_render_lane(render_lane);
+                return None;
+            }
+            let Some(sequence) = policy.next_present_sequence() else {
+                let id = policy.tracked.get(&key).map(|tracked| tracked.id);
+                // No later callback can be ordered faithfully once the process-wide
+                // Present counter is exhausted. Fail closed for interception while
+                // preserving native Present forwarding and retiring input capture.
+                let owns_exhaustion = !self.closing.swap(true, Ordering::AcqRel);
+                self.gate.close();
+                let retirements = if owns_exhaustion {
+                    policy
+                        .registry
+                        .iter()
+                        .map(|session| {
+                            SwapChainRetirement::new(
+                                session.id(),
+                                session.generation(),
+                                policy.sequence,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                drop(policy);
+
+                if owns_exhaustion {
+                    self.emit_diagnostic(DiagnosticEvent::SwapChainFailure {
+                        swap_chain: id.map(diagnostic_id),
+                        operation: SwapChainOperation::Present,
+                        code: FailureCode::Internal(InternalFailure::InvalidState),
+                    });
+                    for retirement in retirements {
+                        self.retire_or_defer(retirement, render_lane.is_some());
+                    }
+                }
+                self.finish_render_lane(render_lane);
+                return None;
+            };
             policy.tracked.get_mut(&key).map(|tracked| {
                 tracked.activity.present_count = tracked.activity.present_count.saturating_add(1);
                 tracked.activity.last_present_sequence = sequence;
@@ -431,7 +475,7 @@ impl Inner {
 
         let (transition_sequence, transition, retirement) = {
             let mut policy = lock(&self.policy);
-            if !policy.is_current_present(key, id, sequence) {
+            if self.is_closing() || !policy.is_current_present(key, id, sequence) {
                 return Some(invocation);
             }
             let device = policy.device_id(metadata.device_identity);
@@ -505,7 +549,11 @@ impl Inner {
     }
 
     fn render_selected_in_lane(&self, pointer: NonNull<c_void>, ticket: RenderTicket) {
-        if !lock(&self.policy).permits_render_ticket(ticket) {
+        let permitted = {
+            let policy = lock(&self.policy);
+            !self.is_closing() && policy.permits_render_ticket(ticket)
+        };
+        if !permitted {
             return;
         }
 
@@ -517,7 +565,11 @@ impl Inner {
             ticket.generation,
             ticket.stage,
         ));
-        if !lock(&self.policy).permits_render_ticket(ticket) {
+        let still_permitted = {
+            let policy = lock(&self.policy);
+            !self.is_closing() && policy.permits_render_ticket(ticket)
+        };
+        if !still_permitted {
             return;
         }
         self.emit_observation(DxgiObservationEvent::RenderSelected {
@@ -1048,6 +1100,12 @@ impl PolicyState {
         id
     }
 
+    fn next_present_sequence(&mut self) -> Option<u64> {
+        let next = self.sequence.checked_add(1)?;
+        self.sequence = next;
+        Some(next)
+    }
+
     fn next_selection_sequence(&mut self) -> u64 {
         self.selection_sequence = self.selection_sequence.saturating_add(1);
         self.selection_sequence
@@ -1263,23 +1321,30 @@ mod tests {
     #[derive(Default)]
     struct RecordingCallbacks {
         observations: Mutex<Vec<DxgiObservationEvent>>,
+        diagnostics: Mutex<Vec<DiagnosticEvent>>,
     }
 
     impl DxgiCallbacks for RecordingCallbacks {
         fn observation(&self, event: DxgiObservationEvent) {
             lock(&self.observations).push(event);
         }
+
+        fn diagnostic(&self, event: DiagnosticEvent) {
+            lock(&self.diagnostics).push(event);
+        }
     }
 
     #[derive(Default)]
     struct RetiringRenderer {
+        renders: Mutex<Vec<SwapChainId>>,
         retired: Mutex<Vec<SwapChainRetirement>>,
         resize_preparations: Mutex<Vec<SwapChainId>>,
         resize_completions: Mutex<Vec<SwapChainId>>,
     }
 
     impl OverlayRenderer for RetiringRenderer {
-        fn render(&self, _frame: &PresentFrame<'_>) -> Result<(), RenderCallbackError> {
+        fn render(&self, frame: &PresentFrame<'_>) -> Result<(), RenderCallbackError> {
+            lock(&self.renders).push(frame.id());
             Ok(())
         }
 
@@ -1438,6 +1503,143 @@ mod tests {
         );
         drop(lease);
         assert!(lane.try_enter().is_some());
+    }
+
+    #[test]
+    fn present_sequence_exhaustion_closes_interception_and_retires_the_active_session() {
+        let renderer = Arc::new(RetiringRenderer::default());
+        let callbacks = Arc::new(RecordingCallbacks::default());
+        let manager = DxgiInterceptionManager::new(
+            DxgiConfig::default(),
+            callbacks.clone(),
+            Some(renderer.clone()),
+        );
+        let key = 0xCAFE_usize;
+        let id = SwapChainId::new(1);
+        let other_id = SwapChainId::new(2);
+        {
+            let mut policy = lock(&manager.inner.policy);
+            track_observation(
+                &mut policy,
+                key,
+                observation(id.get(), Extent2D::new(1920, 1080), u64::MAX),
+            );
+            track_observation(
+                &mut policy,
+                key + 1,
+                observation(other_id.get(), Extent2D::new(1280, 720), u64::MAX),
+            );
+            let transition = policy.reconcile_render_selection(Some(id), u64::MAX);
+            assert!(transition.render.is_some());
+            policy.sequence = u64::MAX;
+        }
+
+        let start = Arc::new(Barrier::new(3));
+        let contenders: Vec<_> = (0..2)
+            .map(|_| {
+                let inner = Arc::clone(&manager.inner);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    inner
+                        .before_present(key as *mut c_void, PresentMethod::Present)
+                        .is_none()
+                })
+            })
+            .collect();
+        start.wait();
+        for contender in contenders {
+            assert!(
+                contender
+                    .join()
+                    .expect("exhaustion contender should finish")
+            );
+        }
+        assert!(manager.inner.is_closing());
+        assert!(!manager.inner.gate.is_open());
+        assert!(manager.inner.gate.try_enter().is_none());
+        assert!(
+            manager
+                .inner
+                .before_present(key as *mut c_void, PresentMethod::Present)
+                .is_none()
+        );
+
+        let retired = lock(&renderer.retired);
+        assert_eq!(retired.len(), 2);
+        assert_eq!(retired[0].id(), id);
+        assert_eq!(retired[1].id(), other_id);
+        assert!(
+            retired
+                .iter()
+                .all(|retirement| retirement.sequence() == u64::MAX)
+        );
+        assert_eq!(lock(&callbacks.diagnostics).len(), 1);
+    }
+
+    #[test]
+    fn present_sequence_issues_max_once_then_preserves_terminal_state() {
+        let mut policy = failure_policy_state();
+        policy.sequence = u64::MAX - 1;
+
+        assert_eq!(policy.next_present_sequence(), Some(u64::MAX));
+        assert_eq!(policy.next_present_sequence(), None);
+        assert_eq!(policy.sequence, u64::MAX);
+    }
+
+    #[test]
+    fn closed_interception_rejects_an_already_admitted_render_ticket() {
+        let renderer = Arc::new(RetiringRenderer::default());
+        let manager = DxgiInterceptionManager::new(
+            DxgiConfig::default(),
+            Arc::new(NoopCallbacks),
+            Some(renderer.clone()),
+        );
+        let key = 0xBEEF_usize;
+        let id = SwapChainId::new(1);
+        let ticket = {
+            let mut policy = lock(&manager.inner.policy);
+            policy.sequence = 1;
+            track_observation(
+                &mut policy,
+                key,
+                observation(id.get(), Extent2D::new(1920, 1080), 1),
+            );
+            render_ticket(&mut policy, key, id, 1)
+        };
+
+        manager.inner.closing.store(true, Ordering::Release);
+        manager.inner.gate.close();
+        let pointer = NonNull::<c_void>::dangling();
+        manager.inner.try_render_selected(pointer, ticket);
+
+        assert!(lock(&renderer.renders).is_empty());
+    }
+
+    #[test]
+    fn panic_recovery_drains_retirement_queued_behind_the_render_lane() {
+        let renderer = Arc::new(RetiringRenderer::default());
+        let manager = DxgiInterceptionManager::new(
+            DxgiConfig::default(),
+            Arc::new(NoopCallbacks),
+            Some(renderer.clone()),
+        );
+        let id = SwapChainId::new(1);
+        let retirement = SwapChainRetirement::new(id, SessionGeneration::FIRST, 7);
+        let render_lane = manager
+            .inner
+            .try_render_lane()
+            .expect("test should acquire the render lane");
+
+        manager.inner.retire_or_defer(retirement, false);
+        assert_eq!(lock(&manager.inner.pending_retirements).len(), 1);
+        drop(render_lane);
+
+        manager.inner.report_panic(Boundary::Present);
+
+        assert!(lock(&manager.inner.pending_retirements).is_empty());
+        let retired = lock(&renderer.retired);
+        assert_eq!(retired.as_slice(), &[retirement]);
     }
 
     #[test]
