@@ -24,6 +24,20 @@ macro_rules! c_void_shim {
     };
 }
 
+macro_rules! c_unsafe_void_shim {
+    ($name:ident: $alias:ty, ($($argument:ident: $argument_type:ty),* $(,)?), $method:ident) => {
+        pub(crate) unsafe extern "C" fn $name($($argument: $argument_type),*) {
+            dispatch((), |backend| unsafe {
+                // SAFETY: the native ABI caller owns the method-specific raw
+                // pointer contract, which this shim forwards unchanged.
+                backend.$method($($argument),*)
+            });
+        }
+
+        const _: $alias = $name;
+    };
+}
+
 macro_rules! c_return_shim {
     (
         $name:ident: $alias:ty,
@@ -165,7 +179,7 @@ system_return_shim!(
     min_hook_disable
 );
 
-c_void_shim!(
+c_unsafe_void_shim!(
     events_raise: nexus_abi::RaiseEvent,
     (identifier: *const c_char, payload: *mut c_void),
     events_raise
@@ -175,7 +189,7 @@ c_void_shim!(
     (identifier: *const c_char),
     events_raise_notification
 );
-c_void_shim!(
+c_unsafe_void_shim!(
     events_raise_targeted: nexus_abi::RaiseEventTargeted,
     (signature: u32, identifier: *const c_char, payload: *mut c_void),
     events_raise_targeted

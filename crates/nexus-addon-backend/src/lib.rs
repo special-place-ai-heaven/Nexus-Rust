@@ -12,6 +12,8 @@ mod inline_hooks;
 mod logging;
 mod operation;
 mod paths;
+mod production;
+mod services;
 mod ui;
 
 pub use boundary::{CallBoundaryError, NativeCallBoundary, NativeText};
@@ -22,4 +24,9 @@ pub use inline_hooks::InlineHookApi;
 pub use logging::LoggingApi;
 pub use operation::BackendOperationError;
 pub use paths::{PathApi, StablePathError, StablePathStore};
+pub use production::{CoreAddonApiServices, ProductionAddonApiBackend, RequiredAddonApiServices};
+pub use services::{
+    FontBackend, GameBindBackend, InputBindBackend, LocalizationBackend, RequiredServiceResult,
+    TextureBackend, UpdateBackend, WndProcBackend,
+};
 pub use ui::UiApi;

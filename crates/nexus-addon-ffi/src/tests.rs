@@ -156,9 +156,9 @@ impl AddonApiBackend for RecordingBackend {
     record_return!(min_hook_enable(target: *mut c_void) -> MinHookStatus = MinHookStatus(77));
     record_return!(min_hook_disable(target: *mut c_void) -> MinHookStatus = MinHookStatus(77));
 
-    record_void!(events_raise(identifier: *const c_char, payload: *mut c_void));
+    record_unsafe_void!(events_raise(identifier: *const c_char, payload: *mut c_void));
     record_void!(events_raise_notification(identifier: *const c_char));
-    record_void!(events_raise_targeted(
+    record_unsafe_void!(events_raise_targeted(
         signature: u32,
         identifier: *const c_char,
         payload: *mut c_void,
@@ -609,6 +609,7 @@ fn missing_retired_and_panicking_services_fail_closed_by_return_category() {
         "game_binds_is_bound",
         "wnd_proc_send_to_game_only",
         "min_hook_remove",
+        "events_raise",
     ] {
         backend.panic_on(Some(operation));
         // SAFETY: every pointer remains opaque to the recording backend. Its
@@ -630,6 +631,9 @@ fn missing_retired_and_panicking_services_fail_closed_by_return_category() {
                     shims::min_hook_remove(core::ptr::null_mut()).0,
                     MINHOOK_ERROR_NOT_INITIALIZED.0
                 ),
+                "events_raise" => {
+                    shims::events_raise(core::ptr::null(), core::ptr::null_mut());
+                }
                 _ => unreachable!(),
             }
         }

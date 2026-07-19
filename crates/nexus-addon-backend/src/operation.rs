@@ -11,7 +11,4 @@ pub enum BackendOperationError {
     /// A typed domain service rejected a validated request.
     #[error("typed backend service rejected the request")]
     ServiceRejected,
-    /// The compatibility operation has no safe production implementation yet.
-    #[error("compatibility operation is unavailable")]
-    Unsupported,
 }

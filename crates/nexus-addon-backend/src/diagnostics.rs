@@ -12,8 +12,6 @@ pub enum BackendFailure {
     InvalidText,
     /// A validated request was rejected by its domain service.
     ServiceRejected,
-    /// A compatibility operation has not been made safely available.
-    Unsupported,
 }
 
 /// Monotonic counters that can be published without retaining native inputs.
@@ -22,7 +20,6 @@ pub struct BackendFailures {
     native_memory: AtomicU64,
     invalid_text: AtomicU64,
     service_rejected: AtomicU64,
-    unsupported: AtomicU64,
 }
 
 impl BackendFailures {
@@ -34,7 +31,6 @@ impl BackendFailures {
             native_memory: AtomicU64::new(0),
             invalid_text: AtomicU64::new(0),
             service_rejected: AtomicU64::new(0),
-            unsupported: AtomicU64::new(0),
         }
     }
 
@@ -45,7 +41,6 @@ impl BackendFailures {
             BackendFailure::NativeMemory => &self.native_memory,
             BackendFailure::InvalidText => &self.invalid_text,
             BackendFailure::ServiceRejected => &self.service_rejected,
-            BackendFailure::Unsupported => &self.unsupported,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -58,7 +53,6 @@ impl BackendFailures {
             native_memory: self.native_memory.load(Ordering::Relaxed),
             invalid_text: self.invalid_text.load(Ordering::Relaxed),
             service_rejected: self.service_rejected.load(Ordering::Relaxed),
-            unsupported: self.unsupported.load(Ordering::Relaxed),
         }
     }
 }
@@ -89,8 +83,6 @@ pub struct BackendFailureSnapshot {
     pub invalid_text: u64,
     /// Requests rejected after reaching a typed service.
     pub service_rejected: u64,
-    /// Calls rejected because no safe compatibility implementation exists.
-    pub unsupported: u64,
 }
 
 #[cfg(test)]
@@ -105,7 +97,6 @@ mod tests {
         failures.record(BackendFailure::NativeMemory);
         failures.record(BackendFailure::InvalidText);
         failures.record(BackendFailure::ServiceRejected);
-        failures.record(BackendFailure::Unsupported);
 
         assert_eq!(
             failures.snapshot(),
@@ -114,7 +105,6 @@ mod tests {
                 native_memory: 2,
                 invalid_text: 1,
                 service_rejected: 1,
-                unsupported: 1,
             }
         );
         let debug = format!("{failures:?}");

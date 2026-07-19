@@ -612,7 +612,6 @@ mod tests {
         assert_eq!(state, 1);
         assert_eq!(failures.snapshot().native_memory, 1);
         assert_eq!(failures.snapshot().caller_attribution, 2);
-        assert_eq!(failures.snapshot().unsupported, 0);
         assert!(!format!("{api:?}").contains("Sensitive Window"));
     }
 

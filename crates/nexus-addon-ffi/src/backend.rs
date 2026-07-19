@@ -76,11 +76,21 @@ pub trait AddonApiBackend: Send + Sync + 'static {
     fn min_hook_disable(&self, target: *mut c_void) -> MinHookStatus;
 
     /// Raises an untargeted event with an opaque payload.
-    fn events_raise(&self, identifier: *const c_char, payload: *mut c_void);
+    ///
+    /// # Safety
+    ///
+    /// `payload` must satisfy the event-specific native payload contract for
+    /// the complete synchronous dispatch. The backend must not retain it.
+    unsafe fn events_raise(&self, identifier: *const c_char, payload: *mut c_void);
     /// Raises an untargeted notification event.
     fn events_raise_notification(&self, identifier: *const c_char);
     /// Raises a signature-targeted event with an opaque payload.
-    fn events_raise_targeted(
+    ///
+    /// # Safety
+    ///
+    /// `payload` must satisfy the event-specific native payload contract for
+    /// the complete synchronous dispatch. The backend must not retain it.
+    unsafe fn events_raise_targeted(
         &self,
         signature: u32,
         identifier: *const c_char,
