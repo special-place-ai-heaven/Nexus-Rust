@@ -2,14 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use crate::{FailureController, FailurePolicy, SwapChainId, SwapChainObservation};
+use crate::{FailureController, FailurePolicy, RenderStage, SwapChainId, SwapChainObservation};
 
 /// Monotonic render-resource generation for one swap-chain identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionGeneration(u64);
 
 impl SessionGeneration {
-    const FIRST: Self = Self(1);
+    /// First resource generation assigned to a newly observed swap chain.
+    pub const FIRST: Self = Self(1);
 
     /// Returns the one-based generation number.
     #[must_use]
@@ -105,6 +106,7 @@ pub struct SwapChainSession {
     generation: SessionGeneration,
     lifecycle: SessionLifecycle,
     failures: FailureController,
+    latest_outcome_sequences: BTreeMap<RenderStage, u64>,
 }
 
 impl SwapChainSession {
@@ -141,6 +143,34 @@ impl SwapChainSession {
     /// Returns mutable failure state for recording isolated stage outcomes.
     pub const fn failures_mut(&mut self) -> &mut FailureController {
         &mut self.failures
+    }
+
+    /// Applies a stage outcome only when it is newer than every prior outcome
+    /// observed for that stage in the current generation.
+    ///
+    /// Returns `false` for stale or duplicate completions without changing the
+    /// stage's failure state. A generation advance resets the ordering history.
+    pub fn record_render_outcome(
+        &mut self,
+        stage: RenderStage,
+        sequence: u64,
+        succeeded: bool,
+    ) -> bool {
+        if self
+            .latest_outcome_sequences
+            .get(&stage)
+            .is_some_and(|latest| sequence <= *latest)
+        {
+            return false;
+        }
+
+        self.latest_outcome_sequences.insert(stage, sequence);
+        if succeeded {
+            let _ = self.failures.record_success(stage);
+        } else {
+            let _ = self.failures.record_failure(stage, sequence);
+        }
+        true
     }
 }
 
@@ -206,6 +236,7 @@ impl SwapChainRegistry {
                     if !changes.is_empty() {
                         session.generation = session.generation.next();
                         session.failures = FailureController::new(self.failure_policy);
+                        session.latest_outcome_sequences.clear();
                         events.push(SessionEvent {
                             id,
                             generation: session.generation,
@@ -236,6 +267,7 @@ impl SwapChainRegistry {
                             generation,
                             lifecycle: target_lifecycle,
                             failures: FailureController::new(self.failure_policy),
+                            latest_outcome_sequences: BTreeMap::new(),
                         },
                     );
                     events.push(SessionEvent {
@@ -362,6 +394,54 @@ mod tests {
                     if changes == &[GenerationChange::Size]
             )
         }));
+    }
+
+    #[test]
+    fn late_older_success_cannot_erase_newer_failure() {
+        let mut registry = SwapChainRegistry::default();
+        let initial = observation(1);
+        let _ = registry.reconcile(std::slice::from_ref(&initial), Some(initial.id));
+        let session = registry
+            .get_mut(initial.id)
+            .expect("session was discovered");
+
+        assert!(session.record_render_outcome(RenderStage::CoreUi, 2, false));
+        assert!(!session.record_render_outcome(RenderStage::CoreUi, 1, true));
+        assert!(!session.record_render_outcome(RenderStage::CoreUi, 2, true));
+        assert!(matches!(
+            session.failures().state(RenderStage::CoreUi),
+            crate::StageFailureState::Healthy {
+                consecutive_failures: 1,
+                cooldowns: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn generation_advance_resets_render_outcome_ordering() {
+        let mut registry = SwapChainRegistry::default();
+        let initial = observation(1);
+        let _ = registry.reconcile(std::slice::from_ref(&initial), Some(initial.id));
+        let session = registry
+            .get_mut(initial.id)
+            .expect("session was discovered");
+        assert!(session.record_render_outcome(RenderStage::CoreUi, 100, false));
+
+        let mut resized = initial;
+        resized.size = Extent2D::new(2560, 1440);
+        let _ = registry.reconcile(std::slice::from_ref(&resized), Some(resized.id));
+
+        let session = registry
+            .get_mut(resized.id)
+            .expect("resized session remains present");
+        assert!(session.record_render_outcome(RenderStage::CoreUi, 1, false));
+        assert!(matches!(
+            session.failures().state(RenderStage::CoreUi),
+            crate::StageFailureState::Healthy {
+                consecutive_failures: 1,
+                cooldowns: 0
+            }
+        ));
     }
 
     #[test]

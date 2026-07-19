@@ -90,7 +90,7 @@ impl WindowTarget {
     pub(crate) fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
         self.visible.store(false, Ordering::Release);
-        self.set_capture(false, false);
+        self.reset();
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
@@ -118,6 +118,10 @@ impl WindowTarget {
         self.bound_hwnd.store(hwnd, Ordering::Release);
     }
 
+    pub(crate) fn is_bound_window(&self, hwnd: usize) -> bool {
+        hwnd != 0 && self.bound_hwnd.load(Ordering::Acquire) == hwnd
+    }
+
     pub(crate) fn request_thread_cleanup(&self) {
         let hwnd = self.bound_hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
@@ -143,7 +147,7 @@ impl WindowTarget {
     }
 
     pub(crate) fn enqueue(&self, mut message: Win32Message) {
-        if !is_pointer_free_message(message.message) {
+        if !self.is_active() || !is_pointer_free_message(message.message) {
             return;
         }
         if message.message == WM_DEVICECHANGE {
@@ -158,7 +162,9 @@ impl WindowTarget {
                 self.push_bounded(&mut queue, message);
             }
             Err(TryLockError::WouldBlock) => {
-                self.input_lost.store(true, Ordering::Release);
+                if self.is_active() {
+                    self.input_lost.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -177,6 +183,11 @@ impl WindowTarget {
 
     pub(crate) fn drain(&self) -> Vec<Win32Message> {
         let mut queue = recover(&self.queue);
+        if !self.is_active() {
+            queue.clear();
+            self.input_lost.store(false, Ordering::Release);
+            return Vec::new();
+        }
         if self.input_lost.swap(false, Ordering::AcqRel) {
             queue.clear();
             return vec![Win32Message {
@@ -195,6 +206,12 @@ impl WindowTarget {
     }
 
     fn push_bounded(&self, queue: &mut VecDeque<Win32Message>, message: Win32Message) {
+        // Deactivation stores `active = false` before taking this same queue
+        // lock to reset it. Checking while the lock is held means either this
+        // enqueue precedes that reset or it is rejected after shutdown.
+        if !self.is_active() {
+            return;
+        }
         if queue.len() == MESSAGE_CAPACITY {
             queue.clear();
             self.input_lost.store(true, Ordering::Release);
@@ -301,6 +318,17 @@ mod tests {
         target.set_capture(true, true);
         target.enqueue(message(WM_KEYDOWN, 1));
         target.reset();
+        assert!(target.drain().is_empty());
+        assert!(!target.should_consume(WM_KEYDOWN));
+    }
+
+    #[test]
+    fn deactivated_target_rejects_and_drops_queued_input() {
+        let target = target(true);
+        target.enqueue(message(WM_KEYDOWN, 1));
+        target.deactivate();
+        target.enqueue(message(WM_KEYDOWN, 2));
+
         assert!(target.drain().is_empty());
         assert!(!target.should_consume(WM_KEYDOWN));
     }

@@ -36,11 +36,14 @@ mod sdk;
 
 pub use callbacks::{
     DxgiCallbacks, OverlayRenderer, PresentFrame, RenderCallbackError, ResizeFrame,
+    SwapChainRetirement,
 };
 pub use error::DxgiError;
 pub use event::{
     AttachOutcome, Boundary, DxgiObservationEvent, FactoryInterface, HResultDisposition,
-    ObjectKind, ObservationField, ShutdownReport, SwapChainInterface,
+    ObjectKind, ObservationField, RenderCandidateRejection, RenderFailurePolicySuppression,
+    RenderOverrideFailure, RenderSelectionDeferred, RenderSelectionFailure,
+    RenderSelectionResolved, ShutdownReport, SwapChainInterface,
 };
 pub use manager::{DxgiConfig, DxgiInterceptionManager};
 pub use sdk::{factory_iid, swap_chain_iid};

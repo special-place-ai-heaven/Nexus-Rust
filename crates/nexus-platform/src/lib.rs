@@ -10,6 +10,7 @@ mod logging;
 mod paths;
 mod scheduler;
 mod settings;
+mod window;
 
 pub use logging::{
     ConsoleLogSink, DispatchReport, FileLogSink, LegacyLogFormatter, LogClock, LogLevel, LogRecord,
@@ -21,3 +22,7 @@ pub use scheduler::{
     TaskPriority,
 };
 pub use settings::{LoadOutcome, NotificationReport, SettingsError, SettingsStore, SubscriptionId};
+pub use window::{
+    NativeWindowHandle, discover_current_process_top_level_window,
+    discover_current_process_top_level_window_by_class,
+};

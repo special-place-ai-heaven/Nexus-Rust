@@ -4,11 +4,13 @@ use core::ptr::NonNull;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
-use nexus_dxgi::{OverlayRenderer, PresentFrame, RenderCallbackError, ResizeFrame};
+use nexus_dxgi::{
+    OverlayRenderer, PresentFrame, RenderCallbackError, ResizeFrame, SwapChainRetirement,
+};
 use nexus_imgui_compat::sys;
 use nexus_imgui_d3d11::{D3d11Renderer, RendererError};
 use nexus_imgui_win32::{PlatformError, Win32Platform};
@@ -17,7 +19,10 @@ use windows::Win32::Graphics::Dxgi::{IDXGISwapChain, IDXGISwapChain1};
 use windows::core::Interface;
 use windows_sys::Win32::Foundation::HWND;
 
-use crate::affinity::{AffinityStatus, ThreadAffinity};
+use crate::affinity::{
+    AffinityClaimError, AffinityStatus, ThreadAffinity, ThreadAffinityClaim, ThreadAffinityLease,
+    WeakThreadAffinity,
+};
 use crate::message_queue::WindowTarget;
 use crate::signal::{NoopShutdownSignal, ShutdownSignal};
 use crate::subclass::{SubclassError, WindowSubclass};
@@ -230,7 +235,7 @@ pub struct OverlayAdapter {
     builder: Arc<dyn UiFrameBuilder>,
     observer: Arc<dyn RenderSessionObserver>,
     target: Arc<WindowTarget>,
-    affinity: ThreadAffinity,
+    affinities: Mutex<HashMap<u64, WeakThreadAffinity>>,
 }
 
 impl OverlayAdapter {
@@ -278,7 +283,7 @@ impl OverlayAdapter {
             builder,
             observer,
             target: Arc::new(WindowTarget::with_router(true, shutdown, router)),
-            affinity: ThreadAffinity::default(),
+            affinities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -296,45 +301,116 @@ impl OverlayAdapter {
         self.target.is_visible()
     }
 
+    /// Synchronously disables window routing and releases native state owned
+    /// by the calling thread.
+    ///
+    /// The process may retain this adapter after DXGI interception begins
+    /// shutting down, so input pass-through cannot depend on `Drop` running.
+    /// Native state owned by another thread remains cooperatively retired when
+    /// that thread next enters the subclass or render callback.
+    pub fn deactivate(&self) {
+        self.target.deactivate();
+        retire_thread_state(self.id);
+        self.target.request_thread_cleanup();
+    }
+
+    fn claim_affinity(
+        &self,
+        swap_chain: SwapChainId,
+    ) -> Result<ThreadAffinityClaim, AffinityClaimError> {
+        let mut affinities = recover_mutex(&self.affinities);
+        affinities.retain(|_, affinity| affinity.is_alive());
+        let affinity = affinities
+            .get(&swap_chain.get())
+            .and_then(WeakThreadAffinity::upgrade)
+            .unwrap_or_else(|| {
+                let affinity = ThreadAffinity::default();
+                affinities.insert(swap_chain.get(), affinity.downgrade());
+                affinity
+            });
+        let claim = affinity.begin_claim();
+        drop(affinities);
+        claim
+    }
+
+    fn affinity_status(&self, swap_chain: SwapChainId) -> AffinityStatus {
+        let mut affinities = recover_mutex(&self.affinities);
+        let Some(affinity) = affinities
+            .get(&swap_chain.get())
+            .and_then(WeakThreadAffinity::upgrade)
+        else {
+            affinities.remove(&swap_chain.get());
+            return AffinityStatus::Unclaimed;
+        };
+        affinity.status()
+    }
+
     fn render_owned(&self, frame: &PresentFrame<'_>) -> Result<(), RenderCallbackError> {
-        if self.affinity.claim() != AffinityStatus::Owner {
-            return Err(invalid_state(RenderOperation::PrepareTarget));
-        }
+        ensure_target_active(&self.target)?;
+        let affinity_claim = self
+            .claim_affinity(frame.id())
+            .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
 
         let generation = frame.generation().get();
+        let present_sequence = frame.sequence();
         let swap_chain_id = frame.id();
         self.target.select_swap_chain(swap_chain_id.get());
 
         THREAD_STATES
-            .try_with(|states| {
+            .try_with(move |states| {
                 let mut states = states
                     .try_borrow_mut()
                     .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
                 let replace = states
                     .get(&self.id)
-                    .is_none_or(|state| state.swap_chain_id != swap_chain_id);
+                    .is_none_or(|state| !state.identity.matches(swap_chain_id, generation));
                 if replace {
                     states.remove(&self.id);
                     self.target.reset();
+                    let affinity_lease = affinity_claim
+                        .commit()
+                        .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
+                    let identity =
+                        RenderSessionIdentity::new(swap_chain_id, generation, present_sequence);
                     let state = RenderThreadState::attach(
                         frame.swap_chain().as_ptr(),
                         self.id,
-                        swap_chain_id,
-                        generation,
+                        identity,
+                        affinity_lease,
                         &self.target,
                         &self.observer,
                     )?;
-                    states.insert(self.id, state);
+                    publish_after_first_success(
+                        state,
+                        |state| {
+                            state.render(
+                                generation,
+                                frame.stage(),
+                                self.builder.as_ref(),
+                                &self.target,
+                            )
+                        },
+                        |state| {
+                            states.insert(self.id, state);
+                        },
+                        || self.target.reset(),
+                    )
+                } else {
+                    // The state already holds the one or more exact committed
+                    // leases that own this adapter. This frame's reentrant
+                    // claim is provisional only and must not extend ownership.
+                    drop(affinity_claim);
+                    let state = states
+                        .get_mut(&self.id)
+                        .ok_or_else(|| invalid_state(RenderOperation::PrepareTarget))?;
+                    state.identity.observe_present(present_sequence);
+                    state.render(
+                        generation,
+                        frame.stage(),
+                        self.builder.as_ref(),
+                        &self.target,
+                    )
                 }
-                let state = states
-                    .get_mut(&self.id)
-                    .ok_or_else(|| invalid_state(RenderOperation::PrepareTarget))?;
-                state.render(
-                    generation,
-                    frame.stage(),
-                    self.builder.as_ref(),
-                    &self.target,
-                )
             })
             .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?
     }
@@ -350,7 +426,7 @@ impl OverlayAdapter {
         if !self.target.is_selected_swap_chain(frame.id().get()) {
             return Ok(());
         }
-        match self.affinity.status() {
+        match self.affinity_status(frame.id()) {
             AffinityStatus::Unclaimed => return Ok(()),
             AffinityStatus::Foreign => {
                 return Err(invalid_state(RenderOperation::PrepareTarget));
@@ -363,7 +439,7 @@ impl OverlayAdapter {
                     .try_borrow_mut()
                     .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
                 if let Some(state) = states.get_mut(&self.id)
-                    && state.swap_chain_id == frame.id()
+                    && state.identity.swap_chain_id == frame.id()
                 {
                     state.resize_phase = phase;
                 }
@@ -385,15 +461,24 @@ impl OverlayRenderer for OverlayAdapter {
     fn after_resize(&self, frame: &ResizeFrame<'_>) -> Result<(), RenderCallbackError> {
         self.mark_resize(frame, ResizePhase::Completed)
     }
+
+    fn retire_swap_chain(
+        &self,
+        retirement: SwapChainRetirement,
+    ) -> Result<(), RenderCallbackError> {
+        let retired = retire_current_thread_state(self.id, retirement)?;
+        if retired {
+            // Retirement is a fail-open boundary: stale capture intent must
+            // never survive after this chain stops being render-selected.
+            self.target.set_capture(false, false);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OverlayAdapter {
     fn drop(&mut self) {
-        self.target.deactivate();
-        if self.affinity.status() == AffinityStatus::Owner {
-            retire_thread_state(self.id);
-        }
-        self.target.request_thread_cleanup();
+        self.deactivate();
     }
 }
 
@@ -405,37 +490,80 @@ enum ResizePhase {
     Completed,
 }
 
-struct RenderThreadState {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderSessionIdentity {
     swap_chain_id: SwapChainId,
+    generation: u64,
+    latest_present_sequence: u64,
+}
+
+impl RenderSessionIdentity {
+    const fn new(
+        swap_chain_id: SwapChainId,
+        generation: u64,
+        latest_present_sequence: u64,
+    ) -> Self {
+        Self {
+            swap_chain_id,
+            generation,
+            latest_present_sequence,
+        }
+    }
+
+    fn matches(self, swap_chain_id: SwapChainId, generation: u64) -> bool {
+        self.swap_chain_id == swap_chain_id && self.generation == generation
+    }
+
+    fn observe_present(&mut self, sequence: u64) {
+        self.latest_present_sequence = self.latest_present_sequence.max(sequence);
+    }
+
+    fn is_retired_by(self, retirement: SwapChainRetirement) -> bool {
+        self.swap_chain_id == retirement.id()
+            && self.generation <= retirement.generation().get()
+            && self.latest_present_sequence <= retirement.sequence()
+    }
+}
+
+struct RenderThreadState {
+    identity: RenderSessionIdentity,
     subclass: Option<WindowSubclass>,
     attachment: Option<Box<dyn RenderSessionAttachment>>,
     renderer: D3d11Renderer,
     platform: Win32Platform,
     resize_phase: ResizePhase,
+    _affinity_lease: ThreadAffinityLease,
 }
 
 impl RenderThreadState {
     fn attach(
         raw_swap_chain: *mut c_void,
         adapter_id: u64,
-        swap_chain_id: SwapChainId,
-        generation: u64,
+        identity: RenderSessionIdentity,
+        affinity_lease: ThreadAffinityLease,
         target: &Arc<WindowTarget>,
         observer: &Arc<dyn RenderSessionObserver>,
     ) -> Result<Self, RenderCallbackError> {
+        ensure_target_active(target)?;
         // SAFETY: `PresentFrame` guarantees that the borrowed pointer is a live
         // IDXGISwapChain for the synchronous callback.
         let hwnd = unsafe { selected_output_window(raw_swap_chain) }.map_err(window_failure)?;
+        // Rebind before native initialization so stale subclasses fail open
+        // throughout a selected-chain handoff, including failure paths.
+        target.bind_window(hwnd as usize);
         // SAFETY: the same callback contract holds through this attach call;
         // the renderer acquires its own COM reference before returning.
         let mut renderer =
-            unsafe { D3d11Renderer::attach_raw_borrowed(raw_swap_chain, generation) }
+            unsafe { D3d11Renderer::attach_raw_borrowed(raw_swap_chain, identity.generation) }
                 .map_err(renderer_failure)?;
+        ensure_target_active(target)?;
         let platform = renderer
             .with_context_owner(|context| Win32Platform::attach(hwnd, context))
             .map_err(platform_failure)?;
+        ensure_target_active(target)?;
         let subclass =
             WindowSubclass::install(hwnd, adapter_id, target).map_err(subclass_failure)?;
+        ensure_target_active(target)?;
         let imgui_context = NonNull::new(renderer.context_ptr())
             .ok_or_else(|| invalid_state(RenderOperation::PrepareTarget))?;
         let resources = RenderSessionResources {
@@ -443,20 +571,21 @@ impl RenderThreadState {
             device: renderer.device_ptr(),
             imgui_context,
             hwnd: hwnd as usize,
-            swap_chain_id,
-            generation,
+            swap_chain_id: identity.swap_chain_id,
+            generation: identity.generation,
             _borrow: PhantomData,
         };
         let attachment = panic::catch_unwind(AssertUnwindSafe(|| observer.attach(resources)))
             .unwrap_or_else(|_| Err(invalid_state(RenderOperation::PrepareTarget)))?;
-        target.bind_window(hwnd as usize);
+        ensure_target_active(target)?;
         Ok(Self {
-            swap_chain_id,
+            identity,
             subclass: Some(subclass),
             attachment: Some(attachment),
             renderer,
             platform,
             resize_phase: ResizePhase::Idle,
+            _affinity_lease: affinity_lease,
         })
     }
 
@@ -467,6 +596,8 @@ impl RenderThreadState {
         builder: &dyn UiFrameBuilder,
         target: &WindowTarget,
     ) -> Result<(), RenderCallbackError> {
+        ensure_target_active(target)?;
+        target.bind_window(self.platform.hwnd() as usize);
         let current_generation = self.renderer.generation();
         if generation < current_generation {
             target.set_capture(false, false);
@@ -494,6 +625,7 @@ impl RenderThreadState {
         }
 
         let messages = target.drain();
+        ensure_target_active(target)?;
         let messages_handled = self.renderer.with_context_owner(|context| {
             for message in messages {
                 self.platform.handle_message(
@@ -516,6 +648,7 @@ impl RenderThreadState {
             target.set_capture(false, false);
             return Err(error);
         }
+        ensure_target_active(target)?;
 
         let platform_frame = self
             .renderer
@@ -533,6 +666,7 @@ impl RenderThreadState {
                 return Err(error);
             }
         };
+        ensure_target_active(target)?;
         if preparation.needs_font_rebuild()
             && let Err(error) = self.renderer.rebuild_font_texture()
         {
@@ -554,6 +688,7 @@ impl RenderThreadState {
                 return Err(renderer_failure(error));
             }
         };
+        ensure_target_active(target)?;
         target.set_capture(capture_mouse, capture_keyboard);
         built?;
 
@@ -564,6 +699,7 @@ impl RenderThreadState {
         if completed.is_err() {
             target.set_capture(false, false);
         }
+        ensure_target_active(target)?;
         completed
     }
 }
@@ -575,6 +711,28 @@ impl Drop for RenderThreadState {
         }
         if let Some(attachment) = self.attachment.take() {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| drop(attachment)));
+        }
+    }
+}
+
+fn publish_after_first_success<State, Error>(
+    mut state: State,
+    render: impl FnOnce(&mut State) -> Result<(), Error>,
+    publish: impl FnOnce(State),
+    rollback: impl FnOnce(),
+) -> Result<(), Error> {
+    match panic::catch_unwind(AssertUnwindSafe(|| render(&mut state))) {
+        Ok(Ok(())) => {
+            publish(state);
+            Ok(())
+        }
+        Ok(Err(error)) => {
+            rollback();
+            Err(error)
+        }
+        Err(payload) => {
+            rollback();
+            panic::resume_unwind(payload)
         }
     }
 }
@@ -639,6 +797,50 @@ pub(crate) fn retire_thread_state(adapter_id: u64) {
     });
 }
 
+pub(crate) fn retire_thread_state_for_window(adapter_id: u64, hwnd: usize) {
+    let _ = THREAD_STATES.try_with(|states| {
+        if let Ok(mut states) = states.try_borrow_mut() {
+            remove_matching_entry(&mut states, adapter_id, |state| {
+                state.platform.hwnd() as usize == hwnd
+            });
+        }
+    });
+}
+
+fn retire_current_thread_state(
+    adapter_id: u64,
+    retirement: SwapChainRetirement,
+) -> Result<bool, RenderCallbackError> {
+    THREAD_STATES
+        .try_with(|states| {
+            let mut states = states
+                .try_borrow_mut()
+                .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?;
+            Ok(remove_matching_entry(&mut states, adapter_id, |state| {
+                state.identity.is_retired_by(retirement)
+            }))
+        })
+        .map_err(|_| invalid_state(RenderOperation::PrepareTarget))?
+}
+
+fn remove_matching_entry<State>(
+    states: &mut HashMap<u64, State>,
+    adapter_id: u64,
+    matches: impl FnOnce(&State) -> bool,
+) -> bool {
+    let remove = states.get(&adapter_id).is_some_and(matches);
+    if remove {
+        states.remove(&adapter_id);
+    }
+    remove
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn render_operation(stage: RenderStage) -> RenderOperation {
     match stage {
         RenderStage::ProxyOnly | RenderStage::HooksOnly | RenderStage::RenderProbe => {
@@ -701,6 +903,7 @@ fn platform_failure(error: PlatformError) -> RenderCallbackError {
 fn subclass_failure(error: SubclassError) -> RenderCallbackError {
     let code = match error {
         SubclassError::InvalidWindow => FailureCode::Internal(InternalFailure::MissingWindow),
+        SubclassError::InactiveTarget => FailureCode::Internal(InternalFailure::InvalidState),
         SubclassError::ForeignProcess => FailureCode::Internal(InternalFailure::InvalidState),
         SubclassError::HookConflict => FailureCode::Internal(InternalFailure::HookConflict),
         SubclassError::Win32(code) => FailureCode::Win32(code),
@@ -708,29 +911,128 @@ fn subclass_failure(error: SubclassError) -> RenderCallbackError {
     RenderCallbackError::new(RenderOperation::PrepareTarget, code)
 }
 
+fn ensure_target_active(target: &WindowTarget) -> Result<(), RenderCallbackError> {
+    if target.is_active() {
+        Ok(())
+    } else {
+        target.set_capture(false, false);
+        Err(invalid_state(RenderOperation::PrepareTarget))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::ffi::c_void;
     use core::marker::PhantomData;
     use core::ptr::NonNull;
+    use std::collections::HashMap;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use nexus_control::{FailureCode, InternalFailure, RenderOperation};
-    use nexus_dxgi::RenderCallbackError;
+    use nexus_dxgi::{RenderCallbackError, SwapChainRetirement};
     use nexus_imgui_compat::sys;
     use nexus_render::{RenderStage, SwapChainId};
 
-    use super::{
-        NoopRenderSessionObserver, NoopUiFrameBuilder, OverlayAdapter, RenderSessionObserver,
-        RenderSessionResources, UiFrameBuilder, UiFramePreparation, next_adapter_id,
-        render_operation,
+    use crate::affinity::{
+        AffinityClaimError, AffinityStatus, ThreadAffinity, ThreadAffinityLease,
     };
+
+    use super::{
+        NoopRenderSessionObserver, NoopUiFrameBuilder, OverlayAdapter, RenderSessionIdentity,
+        RenderSessionObserver, RenderSessionResources, UiFrameBuilder, UiFramePreparation,
+        next_adapter_id, publish_after_first_success, remove_matching_entry, render_operation,
+    };
+
+    struct LeaseBackedState {
+        _lease: ThreadAffinityLease,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for LeaseBackedState {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn lease_backed_state(affinity: &ThreadAffinity, drops: Arc<AtomicUsize>) -> LeaseBackedState {
+        LeaseBackedState {
+            _lease: affinity
+                .begin_claim()
+                .expect("test state should claim affinity")
+                .commit()
+                .expect("test state should commit its lease"),
+            drops,
+        }
+    }
 
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn process_adapter_is_send_sync_without_native_state() {
         assert_send_sync::<OverlayAdapter>();
+    }
+
+    #[test]
+    fn explicit_deactivation_is_immediate_and_idempotent() {
+        let adapter = OverlayAdapter::new(Arc::new(NoopUiFrameBuilder));
+        adapter.target.set_capture(true, true);
+
+        adapter.deactivate();
+        adapter.deactivate();
+
+        assert!(!adapter.target.is_active());
+        assert!(!adapter.is_visible());
+        assert!(!adapter.target.should_consume(0x0100));
+        assert!(!adapter.target.should_consume(0x0200));
+    }
+
+    #[test]
+    fn different_chains_have_independent_affinity_epochs() {
+        let adapter = Arc::new(OverlayAdapter::new(Arc::new(NoopUiFrameBuilder)));
+        let first_chain = SwapChainId::new(23);
+        let second_chain = SwapChainId::new(24);
+        let first_lease = adapter
+            .claim_affinity(first_chain)
+            .expect("first chain should claim its affinity")
+            .commit()
+            .expect("first chain should commit its affinity");
+
+        let different = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || {
+                different
+                    .claim_affinity(second_chain)
+                    .and_then(|claim| claim.commit())
+                    .is_ok()
+            })
+            .join()
+            .expect("different-chain affinity thread should finish")
+        );
+
+        let same = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || matches!(
+                same.claim_affinity(first_chain),
+                Err(AffinityClaimError::Foreign)
+            ))
+            .join()
+            .expect("same-chain affinity thread should finish")
+        );
+        drop(first_lease);
+
+        let reclaimed = Arc::clone(&adapter);
+        assert!(
+            std::thread::spawn(move || {
+                reclaimed
+                    .claim_affinity(first_chain)
+                    .and_then(|claim| claim.commit())
+                    .is_ok()
+            })
+            .join()
+            .expect("reclaimed affinity thread should finish")
+        );
     }
 
     #[test]
@@ -758,6 +1060,72 @@ mod tests {
             .attach(resources)
             .expect("the no-op observer should always produce a lease");
         drop(attachment);
+    }
+
+    #[test]
+    fn render_state_identity_changes_with_chain_or_generation() {
+        let current = RenderSessionIdentity::new(SwapChainId::new(23), 29, 31);
+
+        assert!(current.matches(SwapChainId::new(23), 29));
+        assert!(!current.matches(SwapChainId::new(23), 30));
+        assert!(!current.matches(SwapChainId::new(24), 29));
+
+        let newer_generation = RenderSessionIdentity::new(
+            SwapChainId::new(23),
+            nexus_render::SessionGeneration::FIRST.get() + 1,
+            1,
+        );
+        assert!(!newer_generation.is_retired_by(SwapChainRetirement::new(
+            SwapChainId::new(23),
+            nexus_render::SessionGeneration::FIRST,
+            u64::MAX,
+        )));
+    }
+
+    #[test]
+    fn cooperative_retirement_releases_only_the_matching_chain_state() {
+        let affinity = ThreadAffinity::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let identity = RenderSessionIdentity::new(
+            SwapChainId::new(23),
+            nexus_render::SessionGeneration::FIRST.get(),
+            31,
+        );
+        let mut states = HashMap::from([(
+            17,
+            (identity, lease_backed_state(&affinity, Arc::clone(&drops))),
+        )]);
+
+        assert!(!remove_matching_entry(&mut states, 17, |(state, _)| {
+            state.is_retired_by(SwapChainRetirement::new(
+                SwapChainId::new(24),
+                nexus_render::SessionGeneration::FIRST,
+                31,
+            ))
+        }));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(affinity.status(), AffinityStatus::Owner);
+
+        assert!(!remove_matching_entry(&mut states, 17, |(state, _)| {
+            state.is_retired_by(SwapChainRetirement::new(
+                SwapChainId::new(23),
+                nexus_render::SessionGeneration::FIRST,
+                30,
+            ))
+        }));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(affinity.status(), AffinityStatus::Owner);
+
+        assert!(remove_matching_entry(&mut states, 17, |(state, _)| {
+            state.is_retired_by(SwapChainRetirement::new(
+                SwapChainId::new(23),
+                nexus_render::SessionGeneration::FIRST,
+                31,
+            ))
+        }));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+        assert!(states.is_empty());
     }
 
     #[test]
@@ -842,5 +1210,75 @@ mod tests {
                 .after_render(core::ptr::null_mut(), RenderStage::Addons)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn failed_first_frame_drops_state_and_releases_affinity() {
+        let affinity = ThreadAffinity::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let state = lease_backed_state(&affinity, Arc::clone(&drops));
+        let rollback_count = Arc::clone(&rollbacks);
+
+        let result = publish_after_first_success(
+            state,
+            |_| Err("first frame failed"),
+            |_| panic!("a failed first frame must not publish its state"),
+            move || {
+                rollback_count.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        assert_eq!(result, Err("first frame failed"));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(rollbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn panicking_first_frame_drops_state_and_releases_affinity() {
+        let affinity = ThreadAffinity::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let rollbacks = Arc::new(AtomicUsize::new(0));
+        let state = lease_backed_state(&affinity, Arc::clone(&drops));
+        let rollback_count = Arc::clone(&rollbacks);
+
+        let unwind = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _: Result<(), ()> = publish_after_first_success(
+                state,
+                |_| -> Result<(), ()> { panic!("first frame panicked") },
+                |_| panic!("a panicking first frame must not publish its state"),
+                move || {
+                    rollback_count.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(rollbacks.load(Ordering::Relaxed), 1);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
+    }
+
+    #[test]
+    fn successful_first_frame_keeps_affinity_coupled_to_published_state() {
+        let affinity = ThreadAffinity::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let state = lease_backed_state(&affinity, Arc::clone(&drops));
+        let mut published = None;
+
+        publish_after_first_success(
+            state,
+            |_| Ok::<(), ()>(()),
+            |state| published = Some(state),
+            || panic!("a successful first frame must not roll back"),
+        )
+        .expect("successful first frame should publish its state");
+
+        assert_eq!(affinity.status(), AffinityStatus::Owner);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(published);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(affinity.status(), AffinityStatus::Unclaimed);
     }
 }

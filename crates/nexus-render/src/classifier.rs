@@ -8,6 +8,7 @@ use crate::{Extent2D, Hwnd, SwapChainId, SwapChainObservation};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassifierConfig {
     expected_game_window: Option<Hwnd>,
+    require_expected_game_window: bool,
     user_override: Option<SwapChainId>,
     minimum_extent: Extent2D,
     stale_after_sequences: u64,
@@ -19,6 +20,7 @@ impl ClassifierConfig {
     pub const fn new(minimum_extent: Extent2D, stale_after_sequences: u64) -> Self {
         Self {
             expected_game_window: None,
+            require_expected_game_window: false,
             user_override: None,
             minimum_extent,
             stale_after_sequences,
@@ -34,6 +36,17 @@ impl ClassifierConfig {
     /// Sets the known game window used as the strongest automatic signal.
     pub const fn set_expected_game_window(&mut self, hwnd: Option<Hwnd>) {
         self.expected_game_window = hwnd;
+    }
+
+    /// Returns whether automatic selection waits for game-window discovery.
+    #[must_use]
+    pub const fn requires_expected_game_window(self) -> bool {
+        self.require_expected_game_window
+    }
+
+    /// Requires a discovered game window before admitting automatic candidates.
+    pub const fn set_require_expected_game_window(&mut self, required: bool) {
+        self.require_expected_game_window = required;
     }
 
     /// Returns the exact user-selected swap chain, if configured.
@@ -81,6 +94,17 @@ impl Default for ClassifierConfig {
 pub enum RejectionReason {
     /// A zero-sized back buffer cannot accept overlay rendering.
     ZeroSized,
+    /// The candidate has no output window for the overlay to attach to.
+    MissingWindowHandle,
+    /// Automatic selection is waiting for discovery of the game window.
+    ExpectedWindowNotDiscovered,
+    /// The candidate belongs to a different window than the discovered game window.
+    UnexpectedWindow {
+        /// Discovered game window required for automatic admission.
+        expected: Hwnd,
+        /// Candidate's reported output window.
+        actual: Hwnd,
+    },
     /// The surface is smaller than the configured automatic-classification floor.
     BelowMinimumExtent {
         /// Configured minimum extent.
@@ -94,7 +118,7 @@ pub enum RejectionReason {
     Occluded,
     /// The candidate has fallen too far behind active presentation traffic.
     Stale {
-        /// Most recent sequence seen across all observations.
+        /// Most recent retained or caller-supplied reference sequence.
         latest_sequence: u64,
         /// Candidate's most recent sequence.
         candidate_sequence: u64,
@@ -294,6 +318,19 @@ impl PrimarySwapChainClassifier {
 
     /// Selects a primary game swap chain and records typed diagnostic reasons.
     pub fn classify(&mut self, observations: &[SwapChainObservation]) -> Classification {
+        self.classify_with_latest_present_sequence(observations, 0)
+    }
+
+    /// Selects a primary game swap chain against an external presentation sequence.
+    ///
+    /// The effective freshness reference is never lower than the newest retained
+    /// observation, so a stale caller reference cannot make retained candidates
+    /// appear newer than they are.
+    pub fn classify_with_latest_present_sequence(
+        &mut self,
+        observations: &[SwapChainObservation],
+        latest_present_sequence: u64,
+    ) -> Classification {
         let override_status = self.try_override(observations);
         if let OverrideStatus::Applied { id } = override_status {
             self.current = Some(id);
@@ -305,11 +342,12 @@ impl PrimarySwapChainClassifier {
             );
         }
 
-        let latest_sequence = observations
+        let retained_latest_sequence = observations
             .iter()
             .map(|observation| observation.activity.last_present_sequence)
             .max()
             .unwrap_or_default();
+        let latest_sequence = latest_present_sequence.max(retained_latest_sequence);
         let mut rejected = Vec::new();
         let mut eligible = Vec::new();
 
@@ -336,9 +374,16 @@ impl PrimarySwapChainClassifier {
             return Classification::none(reason, override_status, rejected);
         };
         let runner_up = eligible.iter().rev().nth(1).copied();
-        let reason = runner_up.map_or(SelectionReason::OnlyEligibleCandidate, |runner_up| {
-            self.selection_reason(winner, runner_up)
-        });
+        let reason = runner_up.map_or_else(
+            || {
+                if self.matches_expected_window(winner) {
+                    SelectionReason::ExpectedGameWindow
+                } else {
+                    SelectionReason::OnlyEligibleCandidate
+                }
+            },
+            |runner_up| self.selection_reason(winner, runner_up),
+        );
 
         self.current = Some(winner.id);
         Classification::selected(winner.id, reason, override_status, rejected)
@@ -367,6 +412,20 @@ impl PrimarySwapChainClassifier {
     ) -> Option<RejectionReason> {
         if observation.size.is_zero() {
             return Some(RejectionReason::ZeroSized);
+        }
+        let Some(hwnd) = observation.hwnd else {
+            return Some(RejectionReason::MissingWindowHandle);
+        };
+        if self.config.require_expected_game_window && self.config.expected_game_window.is_none() {
+            return Some(RejectionReason::ExpectedWindowNotDiscovered);
+        }
+        if let Some(expected) = self.config.expected_game_window
+            && hwnd != expected
+        {
+            return Some(RejectionReason::UnexpectedWindow {
+                expected,
+                actual: hwnd,
+            });
         }
         if observation.size.width < self.config.minimum_extent.width
             || observation.size.height < self.config.minimum_extent.height
@@ -403,12 +462,15 @@ impl PrimarySwapChainClassifier {
     fn rank(
         &self,
         observation: &SwapChainObservation,
-    ) -> (bool, bool, bool, u64, u32, u64, u64, Reverse<SwapChainId>) {
+    ) -> (bool, bool, u64, bool, u32, u64, u64, Reverse<SwapChainId>) {
         (
             self.matches_expected_window(observation),
             observation.activity.foreground,
-            self.current == Some(observation.id),
             observation.size.area(),
+            // Equal-window, equal-extent chains have no trustworthy semantic discriminator.
+            // Retain the current identity ahead of volatile activity to avoid per-present
+            // flapping; an explicit user override remains the deterministic escape hatch.
+            self.current == Some(observation.id),
             observation.activity.consecutive_present_cycles,
             observation.activity.last_present_sequence,
             observation.activity.present_count,
@@ -430,10 +492,10 @@ impl PrimarySwapChainClassifier {
             SelectionReason::ExpectedGameWindow
         } else if winner.activity.foreground != runner_up.activity.foreground {
             SelectionReason::ForegroundWindow
-        } else if (self.current == Some(winner.id)) != (self.current == Some(runner_up.id)) {
-            SelectionReason::RetainedPrimary
         } else if winner.size.area() != runner_up.size.area() {
             SelectionReason::LargestSurface
+        } else if (self.current == Some(winner.id)) != (self.current == Some(runner_up.id)) {
+            SelectionReason::RetainedPrimary
         } else if winner.activity.consecutive_present_cycles
             != runner_up.activity.consecutive_present_cycles
         {
@@ -462,7 +524,10 @@ mod tests {
         SwapChainId, SwapChainObservation,
     };
 
-    use super::{ClassifierConfig, OverrideStatus, PrimarySwapChainClassifier, SelectionReason};
+    use super::{
+        CandidateRejection, ClassifierConfig, NoSelectionReason, OverrideStatus,
+        PrimarySwapChainClassifier, RejectionReason, SelectionReason,
+    };
 
     fn observation(id: u64, hwnd: usize, size: Extent2D, sequence: u64) -> SwapChainObservation {
         SwapChainObservation {
@@ -497,6 +562,180 @@ mod tests {
             result.selection_reason(),
             Some(SelectionReason::ExpectedGameWindow)
         );
+        assert_eq!(result.rejected().len(), 1);
+        assert_eq!(
+            result.rejected()[0].reason(),
+            RejectionReason::UnexpectedWindow {
+                expected: Hwnd::new(100),
+                actual: Hwnd::new(200),
+            }
+        );
+    }
+
+    #[test]
+    fn automatic_candidate_without_window_is_rejected_before_window_discovery() {
+        let mut classifier = PrimarySwapChainClassifier::default();
+        let mut windowless = observation(1, 100, Extent2D::new(1920, 1080), 10);
+        windowless.hwnd = None;
+
+        let result = classifier.classify(&[windowless]);
+
+        assert_eq!(result.selected_id(), None);
+        assert_eq!(
+            result.no_selection_reason(),
+            Some(NoSelectionReason::NoEligibleCandidates)
+        );
+        assert_eq!(result.rejected().len(), 1);
+        assert_eq!(
+            result.rejected()[0].reason(),
+            RejectionReason::MissingWindowHandle
+        );
+    }
+
+    #[test]
+    fn expected_window_discovery_policy_is_opt_in() {
+        let config = ClassifierConfig::default();
+        assert!(!config.requires_expected_game_window());
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let candidate = observation(1, 200, Extent2D::new(1920, 1080), 10);
+
+        let result = classifier.classify(&[candidate]);
+
+        assert_eq!(result.selected_id(), Some(SwapChainId::new(1)));
+        assert_eq!(
+            result.selection_reason(),
+            Some(SelectionReason::OnlyEligibleCandidate)
+        );
+    }
+
+    #[test]
+    fn required_window_discovery_waits_then_selects_expected_chain() {
+        let mut config = ClassifierConfig::default();
+        config.set_require_expected_game_window(true);
+        assert!(config.requires_expected_game_window());
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let auxiliary = observation(1, 200, Extent2D::new(2560, 1440), 10);
+
+        let waiting = classifier.classify(std::slice::from_ref(&auxiliary));
+
+        assert_eq!(waiting.selected_id(), None);
+        assert_eq!(
+            waiting.no_selection_reason(),
+            Some(NoSelectionReason::NoEligibleCandidates)
+        );
+        assert_eq!(waiting.rejected().len(), 1);
+        assert_eq!(
+            waiting.rejected()[0].reason(),
+            RejectionReason::ExpectedWindowNotDiscovered
+        );
+
+        let mut discovered = classifier.config();
+        discovered.set_expected_game_window(Some(Hwnd::new(100)));
+        classifier.set_config(discovered);
+        let game = observation(2, 100, Extent2D::new(1920, 1080), 11);
+        let selected = classifier.classify(&[auxiliary, game]);
+
+        assert_eq!(selected.selected_id(), Some(SwapChainId::new(2)));
+        assert_eq!(
+            selected.selection_reason(),
+            Some(SelectionReason::ExpectedGameWindow)
+        );
+        assert_eq!(selected.rejected().len(), 1);
+        assert_eq!(
+            selected.rejected()[0].reason(),
+            RejectionReason::UnexpectedWindow {
+                expected: Hwnd::new(100),
+                actual: Hwnd::new(200),
+            }
+        );
+    }
+
+    #[test]
+    fn auxiliary_windows_remain_rejected_until_expected_chain_arrives() {
+        let mut config = ClassifierConfig::default();
+        config.set_expected_game_window(Some(Hwnd::new(100)));
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let mut windowless = observation(1, 100, Extent2D::new(1920, 1080), 10);
+        windowless.hwnd = None;
+        let auxiliary = observation(2, 200, Extent2D::new(2560, 1440), 11);
+
+        let waiting = classifier.classify(&[auxiliary.clone(), windowless.clone()]);
+
+        assert_eq!(waiting.selected_id(), None);
+        assert_eq!(waiting.rejected().len(), 2);
+        assert_eq!(
+            waiting.rejected()[0].reason(),
+            RejectionReason::MissingWindowHandle
+        );
+        assert_eq!(
+            waiting.rejected()[1].reason(),
+            RejectionReason::UnexpectedWindow {
+                expected: Hwnd::new(100),
+                actual: Hwnd::new(200),
+            }
+        );
+
+        let game = observation(3, 100, Extent2D::new(1920, 1080), 12);
+        let admitted = classifier.classify(&[windowless, auxiliary, game]);
+
+        assert_eq!(admitted.selected_id(), Some(SwapChainId::new(3)));
+        assert_eq!(
+            admitted.selection_reason(),
+            Some(SelectionReason::ExpectedGameWindow)
+        );
+        assert_eq!(admitted.rejected().len(), 2);
+    }
+
+    #[test]
+    fn same_window_equal_extent_retains_current_until_explicit_override() {
+        let mut config = ClassifierConfig::default();
+        config.set_expected_game_window(Some(Hwnd::new(100)));
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let primary = observation(3, 100, Extent2D::new(1920, 1080), 20);
+        let initial = classifier.classify(std::slice::from_ref(&primary));
+        assert_eq!(initial.selected_id(), Some(SwapChainId::new(3)));
+
+        let mut newer = observation(4, 100, Extent2D::new(1920, 1080), 21);
+        newer.activity.present_count = 10_000;
+        newer.activity.consecutive_present_cycles = 1_000;
+        let retained = classifier.classify(&[newer.clone(), primary.clone()]);
+
+        assert_eq!(retained.selected_id(), Some(SwapChainId::new(3)));
+        assert_eq!(
+            retained.selection_reason(),
+            Some(SelectionReason::RetainedPrimary)
+        );
+
+        let mut overridden = classifier.config();
+        overridden.set_user_override(Some(SwapChainId::new(4)));
+        classifier.set_config(overridden);
+        let explicit = classifier.classify(&[newer, primary]);
+        assert_eq!(explicit.selected_id(), Some(SwapChainId::new(4)));
+        assert_eq!(
+            explicit.selection_reason(),
+            Some(SelectionReason::UserOverride)
+        );
+    }
+
+    #[test]
+    fn stronger_game_surface_replaces_same_window_auxiliary_without_activity_flapping() {
+        let mut config = ClassifierConfig::default();
+        config.set_expected_game_window(Some(Hwnd::new(100)));
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let auxiliary = observation(3, 100, Extent2D::new(640, 480), 20);
+        let initial = classifier.classify(std::slice::from_ref(&auxiliary));
+        assert_eq!(initial.selected_id(), Some(SwapChainId::new(3)));
+
+        let mut game = observation(4, 100, Extent2D::new(1920, 1080), 21);
+        game.activity.consecutive_present_cycles = 1;
+        game.activity.present_count = 1;
+        let recovered = classifier.classify(&[auxiliary, game]);
+
+        assert_eq!(recovered.selected_id(), Some(SwapChainId::new(4)));
+        assert_eq!(
+            recovered.selection_reason(),
+            Some(SelectionReason::LargestSurface)
+        );
     }
 
     #[test]
@@ -520,12 +759,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_override_selects_an_invisible_auxiliary_surface() {
+    fn explicit_override_bypasses_automatic_window_admission() {
         let mut config = ClassifierConfig::default();
+        config.set_require_expected_game_window(true);
         config.set_user_override(Some(SwapChainId::new(2)));
         let mut classifier = PrimarySwapChainClassifier::new(config);
         let game = observation(1, 100, Extent2D::new(2560, 1440), 100);
         let mut auxiliary = observation(2, 200, Extent2D::new(800, 600), 1);
+        auxiliary.hwnd = None;
         auxiliary.activity.window_visible = false;
         auxiliary.activity.occluded = true;
 
@@ -558,5 +799,61 @@ mod tests {
 
         assert_eq!(result.selected_id(), Some(SwapChainId::new(3)));
         assert_eq!(result.rejected().len(), 1);
+    }
+
+    #[test]
+    fn filtered_recent_primary_sequence_keeps_old_auxiliary_stale() {
+        let mut config = ClassifierConfig::default();
+        config.set_stale_after_sequences(2);
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let recent_primary = observation(1, 100, Extent2D::new(2560, 1440), 20);
+        let old_auxiliary = observation(2, 200, Extent2D::new(800, 600), 10);
+
+        let result = classifier.classify_with_latest_present_sequence(
+            std::slice::from_ref(&old_auxiliary),
+            recent_primary.activity.last_present_sequence,
+        );
+
+        assert_eq!(result.selected_id(), None);
+        assert_eq!(
+            result.no_selection_reason(),
+            Some(NoSelectionReason::NoEligibleCandidates)
+        );
+        assert_eq!(
+            result.rejected(),
+            &[CandidateRejection {
+                id: SwapChainId::new(2),
+                reason: RejectionReason::Stale {
+                    latest_sequence: 20,
+                    candidate_sequence: 10,
+                    allowed_lag: 2,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn external_sequence_below_retained_maximum_cannot_reduce_freshness_reference() {
+        let mut config = ClassifierConfig::default();
+        config.set_stale_after_sequences(2);
+        let mut classifier = PrimarySwapChainClassifier::new(config);
+        let old_auxiliary = observation(2, 200, Extent2D::new(800, 600), 10);
+        let recent_primary = observation(3, 100, Extent2D::new(2560, 1440), 20);
+
+        let result =
+            classifier.classify_with_latest_present_sequence(&[old_auxiliary, recent_primary], 5);
+
+        assert_eq!(result.selected_id(), Some(SwapChainId::new(3)));
+        assert_eq!(
+            result.rejected(),
+            &[CandidateRejection {
+                id: SwapChainId::new(2),
+                reason: RejectionReason::Stale {
+                    latest_sequence: 20,
+                    candidate_sequence: 10,
+                    allowed_lag: 2,
+                },
+            }]
+        );
     }
 }

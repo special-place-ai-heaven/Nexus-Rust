@@ -114,6 +114,49 @@ impl<'callback> PresentFrame<'callback> {
     }
 }
 
+/// Immutable upper bound for cooperative swap-chain renderer retirement.
+///
+/// A renderer may retire retained state only when it belongs to this chain,
+/// its generation is not newer than [`Self::generation`], and its latest
+/// admitted render callback is not newer than [`Self::sequence`]. This makes
+/// a delayed retirement callback harmless after the same chain renders again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapChainRetirement {
+    id: SwapChainId,
+    generation: SessionGeneration,
+    sequence: u64,
+}
+
+impl SwapChainRetirement {
+    /// Creates an exact cooperative retirement cutoff.
+    #[must_use]
+    pub const fn new(id: SwapChainId, generation: SessionGeneration, sequence: u64) -> Self {
+        Self {
+            id,
+            generation,
+            sequence,
+        }
+    }
+
+    /// Returns the runtime-local swap-chain identity.
+    #[must_use]
+    pub const fn id(self) -> SwapChainId {
+        self.id
+    }
+
+    /// Returns the newest resource generation this callback may retire.
+    #[must_use]
+    pub const fn generation(self) -> SessionGeneration {
+        self.generation
+    }
+
+    /// Returns the newest admitted render callback this retirement may cover.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
 /// Synchronous resize context valid only for the duration of one callback.
 #[derive(Clone, Copy, Debug)]
 pub struct ResizeFrame<'callback> {
@@ -174,6 +217,19 @@ impl<'callback> ResizeFrame<'callback> {
 pub trait OverlayRenderer: Send + Sync + 'static {
     /// Draws the overlay immediately before the native presentation.
     fn render(&self, frame: &PresentFrame<'_>) -> Result<(), RenderCallbackError>;
+
+    /// Retires native state within one exact swap-chain cutoff.
+    ///
+    /// Thread-bound implementations must not destroy another thread's state
+    /// from this callback. Implementations must also ignore state newer than
+    /// the supplied cutoff. A no-op default preserves renderers that do not
+    /// keep per-chain native resources.
+    fn retire_swap_chain(
+        &self,
+        _retirement: SwapChainRetirement,
+    ) -> Result<(), RenderCallbackError> {
+        Ok(())
+    }
 
     /// Releases resources that would prevent the native resize from succeeding.
     fn before_resize(&self, _frame: &ResizeFrame<'_>) -> Result<(), RenderCallbackError> {

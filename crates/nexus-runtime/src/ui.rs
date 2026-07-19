@@ -2,10 +2,10 @@ use core::ptr;
 use std::ffi::CString;
 use std::sync::Arc;
 
-use nexus_dxgi::{DxgiObservationEvent, RenderCallbackError};
+use nexus_dxgi::{DxgiObservationEvent, RenderCallbackError, RenderSelectionDeferred};
 use nexus_imgui_compat::sys;
 use nexus_overlay::{UiFrameBuilder, UiFramePreparation};
-use nexus_render::RenderStage;
+use nexus_render::{RenderStage, SelectionReason};
 use nexus_ui_host::{RenderPhase, UiHost};
 
 const PROBE_TITLE: &[u8] = b"Nexus Rust render probe\0";
@@ -247,6 +247,21 @@ fn draw_core_status() {
             if let Some(latest) = observations.last() {
                 text_owned(format!("Latest DXGI event: {}", observation_label(latest)));
             }
+            match latest_selection_status(&observations) {
+                Some(PrimarySelectionStatus::Resolved(reason)) => {
+                    text_owned(format!(
+                        "Primary selection reason: {}",
+                        selection_reason_label(reason)
+                    ));
+                }
+                Some(PrimarySelectionStatus::Deferred(diagnostic)) => {
+                    text_owned(format!(
+                        "Current primary selection deferral: {}",
+                        selection_deferral_label(diagnostic)
+                    ));
+                }
+                None => {}
+            }
         }
         sys::igEnd();
     }
@@ -268,6 +283,48 @@ fn text_owned(text: String) {
     unsafe { sys::igTextUnformatted(text.as_ptr(), ptr::null()) };
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimarySelectionStatus<'a> {
+    Resolved(SelectionReason),
+    Deferred(&'a RenderSelectionDeferred),
+}
+
+fn latest_selection_status(
+    observations: &[DxgiObservationEvent],
+) -> Option<PrimarySelectionStatus<'_>> {
+    observations
+        .iter()
+        .enumerate()
+        .filter_map(|(arrival, event)| match event {
+            DxgiObservationEvent::RenderSelectionResolved {
+                sequence,
+                resolution,
+            } => Some((
+                *sequence,
+                arrival,
+                PrimarySelectionStatus::Resolved(resolution.reason()),
+            )),
+            DxgiObservationEvent::RenderSelected {
+                sequence, reason, ..
+            } => Some((
+                *sequence,
+                arrival,
+                PrimarySelectionStatus::Resolved(*reason),
+            )),
+            DxgiObservationEvent::RenderSelectionDeferred {
+                sequence,
+                diagnostic,
+            } => Some((
+                *sequence,
+                arrival,
+                PrimarySelectionStatus::Deferred(diagnostic),
+            )),
+            _ => None,
+        })
+        .max_by_key(|(sequence, arrival, _)| (*sequence, *arrival))
+        .map(|(_, _, status)| status)
+}
+
 const fn observation_label(event: &DxgiObservationEvent) -> &'static str {
     match event {
         DxgiObservationEvent::FactoryAttached { .. } => "factory attached",
@@ -276,9 +333,30 @@ const fn observation_label(event: &DxgiObservationEvent) -> &'static str {
         DxgiObservationEvent::PresentForwarded { .. } => "present forwarded",
         DxgiObservationEvent::ResizeForwarded { .. } => "resize forwarded",
         DxgiObservationEvent::ColorSpaceForwarded { .. } => "color space changed",
+        DxgiObservationEvent::RenderSelectionResolved { .. } => "primary render selection resolved",
         DxgiObservationEvent::RenderSelected { .. } => "primary render selected",
+        DxgiObservationEvent::RenderSelectionDeferred { .. } => "primary render selection deferred",
         DxgiObservationEvent::PanicContained { .. } => "panic contained",
         DxgiObservationEvent::Shutdown { .. } => "hooks shut down",
+    }
+}
+
+fn selection_deferral_label(diagnostic: &RenderSelectionDeferred) -> String {
+    diagnostic.to_string()
+}
+
+const fn selection_reason_label(reason: SelectionReason) -> &'static str {
+    match reason {
+        SelectionReason::UserOverride => "user override",
+        SelectionReason::OnlyEligibleCandidate => "only eligible chain",
+        SelectionReason::ExpectedGameWindow => "expected game window",
+        SelectionReason::ForegroundWindow => "foreground window",
+        SelectionReason::RetainedPrimary => "retained healthy primary",
+        SelectionReason::LargestSurface => "largest surface",
+        SelectionReason::LongestActiveStreak => "longest active streak",
+        SelectionReason::MostRecentPresentation => "most recent presentation",
+        SelectionReason::HighestPresentationCount => "highest presentation count",
+        SelectionReason::StableIdentityTieBreak => "stable identity tie-break",
     }
 }
 
@@ -286,15 +364,22 @@ const fn observation_label(event: &DxgiObservationEvent) -> &'static str {
 mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
 
+    use nexus_dxgi::{
+        DxgiObservationEvent, FactoryInterface, RenderSelectionDeferred, RenderSelectionResolved,
+    };
     use nexus_imgui_compat::sys;
     use nexus_overlay::UiFrameBuilder;
-    use nexus_render::RenderStage;
+    use nexus_render::{PrimarySwapChainClassifier, RenderStage, SelectionReason};
     use nexus_ui_host::{OwnerGeneration, RenderPhase, UiCallback, UiHost};
 
     use crate::fonts::RuntimeFontCoordinator;
     use crate::textures::RuntimeTextureCoordinator;
 
-    use super::{CoreUiFrameBuilder, UiSurface, advance_addon_frame, surface_for_stage};
+    use super::{
+        CoreUiFrameBuilder, PrimarySelectionStatus, UiSurface, advance_addon_frame,
+        latest_selection_status, observation_label, selection_deferral_label,
+        selection_reason_label, surface_for_stage,
+    };
 
     fn lock_events<'a>(events: &'a Mutex<Vec<&'static str>>) -> MutexGuard<'a, Vec<&'static str>> {
         match events.lock() {
@@ -375,6 +460,94 @@ mod tests {
         );
         assert_eq!(surface_for_stage(RenderStage::CoreUi), UiSurface::Core);
         assert_eq!(surface_for_stage(RenderStage::Addons), UiSurface::Core);
+    }
+
+    #[test]
+    fn deferred_selection_has_a_stable_ui_label() {
+        let classification = PrimarySwapChainClassifier::default().classify(&[]);
+        let diagnostic = RenderSelectionDeferred::from_classification(&classification)
+            .expect("empty observations should defer selection");
+        let event = DxgiObservationEvent::RenderSelectionDeferred {
+            sequence: 1,
+            diagnostic: diagnostic.clone(),
+        };
+
+        assert_eq!(
+            observation_label(&event),
+            "primary render selection deferred"
+        );
+        assert_eq!(
+            selection_deferral_label(&diagnostic),
+            "no swap-chain observations"
+        );
+    }
+
+    #[test]
+    fn resolved_classification_supersedes_stale_deferral_without_a_render_event() {
+        let classification = PrimarySwapChainClassifier::default().classify(&[]);
+        let diagnostic = RenderSelectionDeferred::from_classification(&classification)
+            .expect("empty observations should defer selection");
+        let resolution = RenderSelectionResolved::new(SelectionReason::ExpectedGameWindow);
+        let observations = [
+            DxgiObservationEvent::RenderSelectionDeferred {
+                sequence: 1,
+                diagnostic: diagnostic.clone(),
+            },
+            DxgiObservationEvent::RenderSelectionResolved {
+                sequence: 2,
+                resolution,
+            },
+            DxgiObservationEvent::FactoryAttached {
+                interface: FactoryInterface::Base,
+            },
+        ];
+
+        assert_eq!(
+            latest_selection_status(&observations),
+            Some(PrimarySelectionStatus::Resolved(
+                SelectionReason::ExpectedGameWindow
+            ))
+        );
+        assert_eq!(
+            observation_label(&observations[1]),
+            "primary render selection resolved"
+        );
+        assert_eq!(
+            selection_reason_label(SelectionReason::ExpectedGameWindow),
+            "expected game window"
+        );
+
+        let stale_deferred_arrived_late = [
+            DxgiObservationEvent::RenderSelectionResolved {
+                sequence: 4,
+                resolution,
+            },
+            DxgiObservationEvent::RenderSelectionDeferred {
+                sequence: 3,
+                diagnostic: diagnostic.clone(),
+            },
+        ];
+        assert_eq!(
+            latest_selection_status(&stale_deferred_arrived_late),
+            Some(PrimarySelectionStatus::Resolved(
+                SelectionReason::ExpectedGameWindow
+            ))
+        );
+
+        let newer_deferred = [
+            DxgiObservationEvent::RenderSelectionResolved {
+                sequence: 4,
+                resolution,
+            },
+            DxgiObservationEvent::RenderSelectionDeferred {
+                sequence: 5,
+                diagnostic,
+            },
+        ];
+        assert!(matches!(
+            latest_selection_status(&newer_deferred),
+            Some(PrimarySelectionStatus::Deferred(_))
+        ));
     }
 
     #[test]
