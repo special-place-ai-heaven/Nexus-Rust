@@ -1,7 +1,10 @@
 use core::ffi::{c_char, c_void};
 use std::sync::Arc;
 
-use nexus_core::{CallbackId, DispatchReport, EventBus, EventHandler, OwnerToken, Subscription};
+use nexus_core::{
+    CallbackId, DispatchReport, EventBus, EventHandler, EventOwnerRetirement,
+    EventRegistrationError, OwnerToken, Subscription, SubscriptionToken,
+};
 use thiserror::Error;
 
 use crate::name::{NameError, ValidatedName, identifier_from_c};
@@ -18,6 +21,9 @@ pub enum EventServiceError {
     /// A subscription did not provide a callback.
     #[error("the event callback is null")]
     MissingCallback,
+    /// Cleanup already retired this exact owner generation.
+    #[error("the event owner generation is retired")]
+    OwnerRetired,
 }
 
 /// Owner-generation-aware ordered event service.
@@ -44,38 +50,91 @@ impl EventService {
         callback_id: CallbackId,
         handler: Arc<EventHandler>,
     ) -> Result<(), EventServiceError> {
+        self.subscribe_handler_tracked(owner, identifier, callback_id, handler)
+            .map(drop)
+    }
+
+    /// Registers a safe handler and returns its exact insertion token.
+    pub fn subscribe_handler_tracked(
+        &self,
+        owner: OwnerToken,
+        identifier: &str,
+        callback_id: CallbackId,
+        handler: Arc<EventHandler>,
+    ) -> Result<SubscriptionToken, EventServiceError> {
         let identifier =
             ValidatedName::identifier(identifier).map_err(EventServiceError::InvalidIdentifier)?;
-        self.bus.subscribe(
-            identifier.into_string(),
-            Subscription::new(owner, callback_id, handler),
-        );
-        Ok(())
+        self.bus
+            .subscribe(
+                identifier.into_string(),
+                Subscription::new(owner, callback_id, handler),
+            )
+            .map_err(|error| match error {
+                EventRegistrationError::OwnerRetired => EventServiceError::OwnerRetired,
+            })
     }
 
     /// Registers one native callback for an explicit addon generation.
     ///
     /// # Safety
     ///
-    /// `callback` must remain executable until it is unsubscribed or `owner`
-    /// is cleaned up. The callback must accept every payload raised for this
-    /// identifier according to that event's native contract.
+    /// `callback` must remain executable through every invocation admitted
+    /// before its subscription is removed or `owner` cleanup reaches
+    /// quiescence. Reentrant unsubscription can return while current-thread or
+    /// nested callback frames are still active, so that return alone does not
+    /// end the executable lifetime. The callback must accept every payload
+    /// raised for this identifier according to that event's native contract.
     pub unsafe fn subscribe_native(
         &self,
         owner: OwnerToken,
         identifier: &str,
         callback: Option<NativeEventCallback>,
     ) -> Result<(), EventServiceError> {
+        // SAFETY: forwarded from this method's callback lifetime and payload
+        // contract.
+        unsafe { self.subscribe_native_tracked(owner, identifier, callback) }.map(drop)
+    }
+
+    /// Registers one native callback and returns its exact insertion token.
+    ///
+    /// # Safety
+    ///
+    /// `callback` must remain executable through every invocation admitted
+    /// before the returned insertion is removed or `owner` cleanup reaches
+    /// quiescence. Reentrant removal can return while current-thread or nested
+    /// callback frames are still active, so that return alone does not end the
+    /// executable lifetime. It must accept every payload raised for
+    /// `identifier` according to that event's native contract.
+    pub unsafe fn subscribe_native_tracked(
+        &self,
+        owner: OwnerToken,
+        identifier: &str,
+        callback: Option<NativeEventCallback>,
+    ) -> Result<SubscriptionToken, EventServiceError> {
         let callback = callback.ok_or(EventServiceError::MissingCallback)?;
         let callback_id =
             CallbackId::new(callback as usize).ok_or(EventServiceError::MissingCallback)?;
         let handler: Arc<EventHandler> = Arc::new(move |data| {
             // SAFETY: native registration guarantees that the callback remains
-            // executable for this owner generation. Generation cleanup removes
-            // the wrapper before the owning module is unloaded.
+            // executable through every admitted invocation, including frames
+            // that outlive reentrant removal. Quiescent generation cleanup
+            // removes the wrapper before the owning module is unloaded.
             unsafe { callback(data) };
         });
-        self.subscribe_handler(owner, identifier, callback_id, handler)
+        self.subscribe_handler_tracked(owner, identifier, callback_id, handler)
+    }
+
+    /// Removes one exact insertion without affecting duplicate callbacks.
+    pub fn unsubscribe_registration(
+        &self,
+        identifier: &str,
+        token: &SubscriptionToken,
+    ) -> Result<bool, EventServiceError> {
+        let identifier =
+            ValidatedName::identifier(identifier).map_err(EventServiceError::InvalidIdentifier)?;
+        Ok(self
+            .bus
+            .unsubscribe_registration(identifier.as_str(), token))
     }
 
     /// Removes all matching callback registrations from one event.
@@ -87,6 +146,20 @@ impl EventService {
         let identifier =
             ValidatedName::identifier(identifier).map_err(EventServiceError::InvalidIdentifier)?;
         Ok(self.bus.unsubscribe(identifier.as_str(), callback_id))
+    }
+
+    /// Removes matching callback registrations for one exact owner generation.
+    pub fn unsubscribe_for_owner(
+        &self,
+        owner: OwnerToken,
+        identifier: &str,
+        callback_id: CallbackId,
+    ) -> Result<usize, EventServiceError> {
+        let identifier =
+            ValidatedName::identifier(identifier).map_err(EventServiceError::InvalidIdentifier)?;
+        Ok(self
+            .bus
+            .unsubscribe_owner(identifier.as_str(), owner, callback_id))
     }
 
     /// Removes one native callback identity from one event.
@@ -104,8 +177,28 @@ impl EventService {
         self.unsubscribe(identifier, callback_id)
     }
 
-    /// Removes every subscription owned by exactly one addon generation.
-    pub fn cleanup_owner(&self, owner: OwnerToken) -> usize {
+    /// Removes one native callback identity for one exact owner generation.
+    pub fn unsubscribe_native_for_owner(
+        &self,
+        owner: OwnerToken,
+        identifier: &str,
+        callback: Option<NativeEventCallback>,
+    ) -> Result<usize, EventServiceError> {
+        let Some(callback) = callback else {
+            return Ok(0);
+        };
+        let Some(callback_id) = CallbackId::new(callback as usize) else {
+            return Ok(0);
+        };
+        self.unsubscribe_for_owner(owner, identifier, callback_id)
+    }
+
+    /// Retires every subscription owned by exactly one addon generation.
+    ///
+    /// A non-quiescent report must be retried after admitted callbacks return;
+    /// native module unload is unsafe until [`EventOwnerRetirement::quiescent`]
+    /// is true.
+    pub fn cleanup_owner(&self, owner: OwnerToken) -> EventOwnerRetirement {
         self.bus.remove_owner(owner)
     }
 
@@ -233,7 +326,7 @@ mod tests {
 
     use nexus_core::{CallbackId, EventHandler, OwnerToken};
 
-    use super::EventService;
+    use super::{EventService, EventServiceError};
 
     fn callback_id(value: usize) -> CallbackId {
         CallbackId::new(value).expect("test callback identities are non-zero")
@@ -323,12 +416,62 @@ mod tests {
             .subscribe_handler(current, "EV_RELOAD", callback_id(2), handler)
             .expect("test subscription should succeed");
 
-        assert_eq!(events.cleanup_owner(stale), 1);
+        let cleanup = events.cleanup_owner(stale);
+        assert_eq!(cleanup.retired(), 1);
+        assert!(cleanup.quiescent());
         assert_eq!(events.subscription_count(), 1);
+        assert_eq!(
+            events
+                .subscribe_handler(stale, "EV_RELOAD", callback_id(3), Arc::new(|_| {}),)
+                .expect_err("retired generation must not republish callbacks"),
+            EventServiceError::OwnerRetired
+        );
         // SAFETY: the remaining test handler ignores the null payload.
         let report = unsafe { events.raise_targeted(42, "EV_RELOAD", core::ptr::null_mut()) }
             .expect("test event name should be valid");
         assert_eq!(report.invoked, 1);
+    }
+
+    #[test]
+    fn native_unsubscribe_is_scoped_to_the_authenticated_owner_generation() {
+        let events = EventService::new();
+        let stale = OwnerToken {
+            signature: 42,
+            generation: 3,
+        };
+        let current = OwnerToken {
+            signature: 42,
+            generation: 4,
+        };
+
+        // SAFETY: the test keeps `count_native` executable for the complete
+        // service lifetime and raises only its documented counter payload.
+        unsafe {
+            events
+                .subscribe_native(stale, "EV_RELOAD", Some(count_native))
+                .expect("stale test subscription should succeed");
+            events
+                .subscribe_native(current, "EV_RELOAD", Some(count_native))
+                .expect("current test subscription should succeed");
+        }
+
+        assert_eq!(
+            events
+                .unsubscribe_native_for_owner(stale, "EV_RELOAD", Some(count_native))
+                .expect("test event name should be valid"),
+            1
+        );
+        assert_eq!(events.subscription_count(), 1);
+
+        let counter = AtomicUsize::new(0);
+        // SAFETY: `count_native` expects the live counter pointer supplied for
+        // this synchronous dispatch.
+        unsafe {
+            events
+                .raise("EV_RELOAD", (&raw const counter).cast_mut().cast())
+                .expect("test event name should be valid");
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -355,6 +498,8 @@ mod tests {
         .expect("the native fixture should dispatch");
         assert_eq!(report.invoked, 1);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
-        assert_eq!(events.cleanup_owner(owner), 1);
+        let cleanup = events.cleanup_owner(owner);
+        assert_eq!(cleanup.retired(), 1);
+        assert!(cleanup.quiescent());
     }
 }

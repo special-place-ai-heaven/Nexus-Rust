@@ -2,10 +2,22 @@
 
 use core::fmt;
 use core::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::OwnerHandle;
 
 type RenderCallback = unsafe extern "C" fn();
+
+const RETAINED_CELL_LOCK_STRIPES: usize = 64;
+
+fn retained_cell_operation(address: NonZeroUsize) -> &'static Mutex<()> {
+    static OPERATIONS: OnceLock<[Mutex<()>; RETAINED_CELL_LOCK_STRIPES]> = OnceLock::new();
+
+    let operations = OPERATIONS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
+    let value = address.get();
+    let stripe = (value ^ value.rotate_right(17)) % RETAINED_CELL_LOCK_STRIPES;
+    &operations[stripe]
+}
 
 /// Explicit boundary wrapper for an addon-owned native render callback.
 ///
@@ -51,27 +63,65 @@ impl fmt::Debug for NativeRenderCallback {
     }
 }
 
-/// Explicit boundary wrapper for the legacy `bool*` close-on-Escape API.
+/// Checked access to one retained legacy visibility cell.
 ///
-/// The pointer is deliberately not exposed by safe APIs. It is only read or
-/// written while its owner's generation activity gate is held.
-#[derive(Clone)]
+/// # Safety
+///
+/// Implementations are trusted host adapters. Before every access they must
+/// enforce the host's provenance policy and reject the operation without
+/// dereferencing an address that fails validation. A policy may rely on this
+/// bridge's unsafe construction proof for heap or TLS storage that cannot be
+/// attributed independently, but it must reject addresses known to belong to a
+/// different owner generation. Implementations must also avoid reentering any
+/// operation that invokes the same retained cell, synchronously
+/// deregistering or cleaning up its registration, or otherwise waiting for it:
+/// the bridge serializes the read/write transaction and the registry holds an
+/// in-flight drain guard across these methods, so that reentrancy would
+/// self-deadlock.
+pub unsafe trait CheckedVisibilityAccess: Send + Sync + 'static {
+    /// Reads the current visibility state after validating the native address.
+    fn read_visible(&self, address: NonZeroUsize) -> Option<bool>;
+
+    /// Writes the hidden state after validating the native address.
+    fn write_hidden(&self, address: NonZeroUsize) -> bool;
+}
+
+/// Owner-scoped retained-cell bridge for the legacy `bool*` Escape API.
+///
+/// The raw address is deliberately not exposed by safe APIs. Access is routed
+/// through [`CheckedVisibilityAccess`] while the exact owner generation's
+/// activity gate is held, and registry cleanup drains in-flight operations
+/// before the adapter can be dropped and its module unloaded.
 pub struct NativeVisibilityPointer {
     address: NonZeroUsize,
     owner: OwnerHandle,
+    access: Arc<dyn CheckedVisibilityAccess>,
 }
 
 impl NativeVisibilityPointer {
-    /// Creates a native visibility pointer from the ABI's `bool*` storage.
+    /// Creates a checked bridge for a non-null native visibility-cell address.
     ///
     /// # Safety
     ///
-    /// `pointer` must be non-null, aligned, and valid for byte reads and
-    /// writes until the associated owner generation has retired and reached
-    /// quiescence. Concurrent access must be synchronized by the caller.
+    /// `address` must identify one initialized, writable byte in the allocation
+    /// belonging to `owner`. That byte must remain the same live allocation and
+    /// must not be repurposed until the owner-scoped deregistration containing
+    /// this value returns, owner cleanup finishes draining it, or this value is
+    /// dropped without being registered. Every other access to the byte must be
+    /// synchronized so that it cannot conflict with adapter reads or writes.
+    /// `access` must uphold [`CheckedVisibilityAccess`]'s contract for this
+    /// owner and address.
     #[must_use]
-    pub unsafe fn from_ptr(owner: OwnerHandle, pointer: *mut u8) -> Option<Self> {
-        NonZeroUsize::new(pointer as usize).map(|address| Self { address, owner })
+    pub unsafe fn checked(
+        owner: OwnerHandle,
+        address: NonZeroUsize,
+        access: Arc<dyn CheckedVisibilityAccess>,
+    ) -> Self {
+        Self {
+            address,
+            owner,
+            access,
+        }
     }
 
     pub(crate) fn address(&self) -> usize {
@@ -82,16 +132,18 @@ impl NativeVisibilityPointer {
         &self.owner
     }
 
-    pub(crate) fn is_visible(&self) -> bool {
-        let pointer = self.address.get() as *const u8;
-        // SAFETY: upheld by `from_ptr` and the owner activity guard.
-        unsafe { pointer.read() != 0 }
-    }
-
-    pub(crate) fn close(&self) {
-        let pointer = self.address.get() as *mut u8;
-        // SAFETY: upheld by `from_ptr` and the owner activity guard.
-        unsafe { pointer.write(0) };
+    pub(crate) fn close_if_visible(&self) -> bool {
+        let Some(_activity) = self.owner.try_enter() else {
+            return false;
+        };
+        let _operation = match retained_cell_operation(self.address).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.access.read_visible(self.address) != Some(true) {
+            return false;
+        }
+        self.access.write_hidden(self.address)
     }
 }
 

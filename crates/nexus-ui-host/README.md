@@ -36,10 +36,21 @@ If cleanup is requested reentrantly from the owner's own callback, it reports
 `wait_owner_quiescent` reports true.
 
 Native functions and legacy `bool*` visibility storage enter through
-`NativeRenderCallback` and `NativeVisibilityPointer`. Their constructors bind
-the native resource to an `OwnerHandle` and are unsafe because the addon must
-keep code and storage valid until generation quiescence; all later calls, reads,
-and writes remain contained behind that exact safe owner gate.
+`NativeRenderCallback` and `NativeVisibilityPointer`. Render functions require
+an unsafe construction proof. Visibility cells instead require a
+`CheckedVisibilityAccess` adapter that validates the native address before
+every read and write without directly dereferencing it. Each retained cell's
+read/check/write transaction is serialized across concurrent Escape handlers.
+Both resources bind to an `OwnerHandle`; generation cleanup removes and drains
+their registrations before DLL unload. Constructing a visibility bridge remains
+unsafe: the native owner must keep the same byte allocation live and synchronize
+all non-host access until deregistration or cleanup has finished draining it.
+Known add-on image ranges are checked and a pointer into another generation is
+rejected. Legacy heap and TLS cells are not independently attributable, so they
+remain an explicit unsafe caller trust boundary after OS page checks. Stronger
+heap isolation requires a future ABI with host-owned state or an authenticated
+allocation-registration handle; it cannot be derived from the legacy raw
+`bool*` alone.
 
 Managed callback panics are caught per registration. A bounded panic budget
 disables only the failing registration, and every callback is invoked after all

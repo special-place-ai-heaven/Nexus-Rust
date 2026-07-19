@@ -33,7 +33,16 @@ pub trait AddonApiBackend: Send + Sync + 'static {
     /// Sends an on-screen alert.
     fn ui_send_alert(&self, message: *const c_char);
     /// Registers a close-on-Escape boolean.
-    fn ui_register_close_on_escape(&self, identifier: *const c_char, state: *mut u8);
+    ///
+    /// # Safety
+    ///
+    /// On successful registration, `state` must remain the same live, writable
+    /// one-byte allocation until deregistration returns or owner cleanup has
+    /// drained the registration. Every other access to the byte must be
+    /// synchronized so it cannot conflict with backend reads or writes. Known
+    /// foreign add-on image addresses are rejected, while heap and TLS storage
+    /// necessarily rely on this native caller proof.
+    unsafe fn ui_register_close_on_escape(&self, identifier: *const c_char, state: *mut u8);
     /// Deregisters a close-on-Escape boolean.
     fn ui_deregister_close_on_escape(&self, identifier: *const c_char);
 
@@ -45,7 +54,15 @@ pub trait AddonApiBackend: Send + Sync + 'static {
     fn paths_get_common_directory(&self) -> *const c_char;
 
     /// Creates a MinHook-compatible hook.
-    fn min_hook_create(
+    ///
+    /// # Safety
+    ///
+    /// `target` and `detour` must denote live functions with compatible ABIs
+    /// and signatures for the full hook lifetime. A non-null `original` must
+    /// denote one live, aligned, exclusively writable pointer-sized object.
+    /// Every user of the published trampoline must have returned before hook
+    /// removal or owner cleanup can destroy it.
+    unsafe fn min_hook_create(
         &self,
         target: *mut c_void,
         detour: *mut c_void,

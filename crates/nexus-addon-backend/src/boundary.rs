@@ -109,23 +109,108 @@ impl NativeCallBoundary {
         &self.failures
     }
 
-    /// Resolves the exact live add-on generation responsible for one call.
+    /// Resolves and authenticates the exact live addon generation for a call.
+    ///
+    /// With no address, attribution comes only from the explicit owner scope
+    /// or native stack. When an address is supplied, it must additionally map
+    /// to that independently resolved current generation.
     pub fn resolve_owner(
         &self,
-        function_hint: Option<NonZeroUsize>,
+        registered_address: Option<NonZeroUsize>,
     ) -> Result<OwnerToken, CallBoundaryError> {
-        self.callers.resolve(function_hint).ok_or_else(|| {
+        let owner = match registered_address {
+            Some(address) => self.callers.resolve_registered_address(address),
+            None => self.callers.resolve_actual(),
+        };
+        owner.ok_or_else(|| {
             self.failures.record(BackendFailure::CallerAttribution);
             CallBoundaryError::CallerAttribution
         })
     }
 
-    /// Resolves a caller using a nullable native function-address hint.
+    /// Authenticates a caller-controlled registered function address.
+    ///
+    /// This compatibility name now has strict semantics: the actual caller is
+    /// resolved independently and the non-null address must belong to that
+    /// same live owner generation.
     pub fn resolve_owner_for_address(
         &self,
-        function_hint: *const c_void,
+        function_address: *const c_void,
     ) -> Result<OwnerToken, CallBoundaryError> {
-        self.resolve_owner(NonZeroUsize::new(function_hint as usize))
+        self.resolve_owner_for_registered_address(function_address)
+    }
+
+    /// Authenticates a registered function address against the actual caller.
+    ///
+    /// The address is treated only as an opaque ownership key. It is never
+    /// dereferenced, retained, formatted, or used as the attribution source.
+    pub fn resolve_owner_for_registered_address(
+        &self,
+        function_address: *const c_void,
+    ) -> Result<OwnerToken, CallBoundaryError> {
+        let Some(address) = NonZeroUsize::new(function_address as usize) else {
+            self.failures.record(BackendFailure::CallerAttribution);
+            return Err(CallBoundaryError::CallerAttribution);
+        };
+
+        self.callers
+            .resolve_registered_address(address)
+            .ok_or_else(|| {
+                self.failures.record(BackendFailure::CallerAttribution);
+                CallBoundaryError::CallerAttribution
+            })
+    }
+
+    /// Validates that an opaque retained address belongs to one exact current
+    /// addon generation.
+    ///
+    /// This proves mapped-image provenance and current-generation admission;
+    /// it does not prove allocation lifetime, aliasing, or synchronization.
+    /// Callers retaining the address must uphold those separate invariants.
+    pub fn validate_owned_address(
+        &self,
+        owner: OwnerToken,
+        address: NonZeroUsize,
+    ) -> Result<(), CallBoundaryError> {
+        if self.callers.address_belongs_to_owner(address, owner) {
+            return Ok(());
+        }
+        self.failures.record(BackendFailure::CallerAttribution);
+        Err(CallBoundaryError::CallerAttribution)
+    }
+
+    /// Validates a retained legacy data address for one exact current owner.
+    ///
+    /// Known addon-image ranges must belong to `owner`. Unmapped addresses are
+    /// admitted for heap and TLS compatibility under the caller's separate
+    /// unsafe allocation-lifetime and synchronization contract. This method
+    /// proves neither of those invariants; resolver failures fail closed.
+    pub fn validate_retained_address(
+        &self,
+        owner: OwnerToken,
+        address: NonZeroUsize,
+    ) -> Result<(), CallBoundaryError> {
+        if self
+            .callers
+            .retained_address_allowed_for_owner(address, owner)
+        {
+            return Ok(());
+        }
+        self.failures.record(BackendFailure::CallerAttribution);
+        Err(CallBoundaryError::CallerAttribution)
+    }
+
+    /// Revalidates that an exact owner generation still accepts API calls.
+    ///
+    /// Registration paths use this after publishing a rollback-capable entry.
+    /// If cleanup closed admission between initial attribution and insertion,
+    /// the caller must remove that exact entry before returning failure.
+    pub fn validate_current_owner(&self, owner: OwnerToken) -> Result<(), CallBoundaryError> {
+        if self.callers.is_current_owner(owner) {
+            return Ok(());
+        }
+        self.failures.record(BackendFailure::CallerAttribution);
+        Err(CallBoundaryError::CallerAttribution)
     }
 
     /// Copies and validates an identifier before it reaches a service.
@@ -268,17 +353,40 @@ mod tests {
         }
     }
 
-    fn boundary(owner: Option<OwnerToken>) -> NativeCallBoundary {
-        NativeCallBoundary::new(
-            Arc::new(AddonCallerResolver::new(Arc::new(FixedOwner(owner)))),
+    struct UnmappedCurrentOwner;
+
+    impl AddressOwnerResolver for UnmappedCurrentOwner {
+        fn owner_for_address(&self, _address: NonZeroUsize) -> Option<OwnerToken> {
+            None
+        }
+
+        fn is_current_owner(&self, owner: OwnerToken) -> bool {
+            owner == OWNER
+        }
+    }
+
+    fn boundary_with_callers(
+        owner: Option<OwnerToken>,
+    ) -> (NativeCallBoundary, Arc<AddonCallerResolver>) {
+        let callers = Arc::new(AddonCallerResolver::new(Arc::new(FixedOwner(owner))));
+        let boundary = NativeCallBoundary::new(
+            Arc::clone(&callers),
             NativeMemoryReader::default(),
             Arc::new(BackendFailures::new()),
-        )
+        );
+        (boundary, callers)
+    }
+
+    fn boundary(owner: Option<OwnerToken>) -> NativeCallBoundary {
+        boundary_with_callers(owner).0
     }
 
     #[test]
     fn caller_resolution_is_generation_exact_and_counts_closed_failures() {
-        let present = boundary(Some(OWNER));
+        let (present, callers) = boundary_with_callers(Some(OWNER));
+        let _scope = callers
+            .enter_owner_scope(OWNER)
+            .expect("current test owner should enter an explicit scope");
         let hint = NonZeroUsize::new(1).expect("non-zero hint");
         assert_eq!(present.resolve_owner(Some(hint)), Ok(OWNER));
 
@@ -288,6 +396,23 @@ mod tests {
             Err(CallBoundaryError::CallerAttribution)
         );
         assert_eq!(missing.failures().snapshot().caller_attribution, 1);
+    }
+
+    #[test]
+    fn retained_validation_distinguishes_unmapped_legacy_storage_from_strict_code_ownership() {
+        let callers = Arc::new(AddonCallerResolver::new(Arc::new(UnmappedCurrentOwner)));
+        let boundary = NativeCallBoundary::new(
+            callers,
+            NativeMemoryReader::default(),
+            Arc::new(BackendFailures::new()),
+        );
+        let address = NonZeroUsize::new(0x10).expect("non-zero test address");
+
+        assert_eq!(boundary.validate_retained_address(OWNER, address), Ok(()));
+        assert_eq!(
+            boundary.validate_owned_address(OWNER, address),
+            Err(CallBoundaryError::CallerAttribution)
+        );
     }
 
     #[test]

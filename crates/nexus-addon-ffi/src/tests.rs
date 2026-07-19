@@ -106,6 +106,15 @@ macro_rules! record_return {
     };
 }
 
+macro_rules! record_unsafe_void {
+    ($name:ident($($argument:ident: $argument_type:ty),* $(,)?)) => {
+        unsafe fn $name(&self, $($argument: $argument_type),*) {
+            let _ = ($($argument,)*);
+            self.hit(stringify!($name));
+        }
+    };
+}
+
 impl AddonApiBackend for RecordingBackend {
     record_void!(renderer_register(phase: RenderPhase, callback: Option<RenderCallback>));
     record_void!(renderer_deregister(callback: Option<RenderCallback>));
@@ -123,18 +132,26 @@ impl AddonApiBackend for RecordingBackend {
 
     record_void!(log_v1(level: LogLevel, message: *const c_char));
     record_void!(ui_send_alert(message: *const c_char));
-    record_void!(ui_register_close_on_escape(identifier: *const c_char, state: *mut u8));
+    record_unsafe_void!(ui_register_close_on_escape(
+        identifier: *const c_char,
+        state: *mut u8
+    ));
     record_void!(ui_deregister_close_on_escape(identifier: *const c_char));
 
     record_return!(paths_get_game_directory() -> *const c_char = NonNull::<c_char>::dangling().as_ptr());
     record_return!(paths_get_addon_directory(name: *const c_char) -> *const c_char = NonNull::<c_char>::dangling().as_ptr());
     record_return!(paths_get_common_directory() -> *const c_char = NonNull::<c_char>::dangling().as_ptr());
 
-    record_return!(min_hook_create(
+    unsafe fn min_hook_create(
+        &self,
         target: *mut c_void,
         detour: *mut c_void,
         original: *mut *mut c_void,
-    ) -> MinHookStatus = MinHookStatus(77));
+    ) -> MinHookStatus {
+        let _ = (target, detour, original);
+        self.hit("min_hook_create");
+        MinHookStatus(77)
+    }
     record_return!(min_hook_remove(target: *mut c_void) -> MinHookStatus = MinHookStatus(77));
     record_return!(min_hook_enable(target: *mut c_void) -> MinHookStatus = MinHookStatus(77));
     record_return!(min_hook_disable(target: *mut c_void) -> MinHookStatus = MinHookStatus(77));

@@ -88,11 +88,19 @@ c_void_shim!(
     (message: *const c_char),
     ui_send_alert
 );
-c_void_shim!(
-    ui_register_close_on_escape: nexus_abi::RegisterCloseOnEscape,
-    (identifier: *const c_char, state: *mut u8),
-    ui_register_close_on_escape
-);
+pub(crate) unsafe extern "C" fn ui_register_close_on_escape(
+    identifier: *const c_char,
+    state: *mut u8,
+) {
+    dispatch((), |backend| {
+        // SAFETY: this shim is itself an unsafe native boundary and forwards
+        // the exact retained-cell lifetime and synchronization obligations to
+        // the backend. The native caller must uphold that contract.
+        unsafe { backend.ui_register_close_on_escape(identifier, state) };
+    });
+}
+
+const _: nexus_abi::RegisterCloseOnEscape = ui_register_close_on_escape;
 c_void_shim!(
     ui_deregister_close_on_escape: nexus_abi::DeregisterCloseOnEscape,
     (identifier: *const c_char),
@@ -121,13 +129,20 @@ c_return_shim!(
     paths_get_common_directory
 );
 
-system_return_shim!(
-    min_hook_create: nexus_abi::CreateHook,
-    (target: *mut c_void, detour: *mut c_void, original: *mut *mut c_void),
-    -> MinHookStatus,
-    MINHOOK_ERROR_NOT_INITIALIZED,
-    min_hook_create
-);
+pub(crate) unsafe extern "system" fn min_hook_create(
+    target: *mut c_void,
+    detour: *mut c_void,
+    original: *mut *mut c_void,
+) -> MinHookStatus {
+    dispatch(MINHOOK_ERROR_NOT_INITIALIZED, |backend| {
+        // SAFETY: this shim is the unsafe native MinHook boundary and forwards
+        // the exact code-lifetime, signature, output, and trampoline-quiescence
+        // obligations to the backend.
+        unsafe { backend.min_hook_create(target, detour, original) }
+    })
+}
+
+const _: nexus_abi::CreateHook = min_hook_create;
 system_return_shim!(
     min_hook_remove: nexus_abi::ChangeHook,
     (target: *mut c_void),

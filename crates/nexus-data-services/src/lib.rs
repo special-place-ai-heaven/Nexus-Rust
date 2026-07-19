@@ -20,7 +20,7 @@ pub use events::{EventService, EventServiceError, NativeEventCallback};
 pub use mapping::{MappingBackend, MappingDisposition, MappingFailure, MappingView};
 pub use mumble::{MumbleResourceError, MumbleResourceSource};
 pub use name::{MAX_IDENTIFIER_BYTES, NameError};
-pub use nexus_core::{CallbackId, DispatchReport, EventHandler, OwnerToken};
+pub use nexus_core::{CallbackId, DispatchReport, EventHandler, EventOwnerRetirement, OwnerToken};
 pub use nexus_link::{
     DL_NEXUS_LINK, FontSnapshot, NexusLinkOpenError, NexusLinkPublisher, NexusLinkSnapshot,
     NexusLinkSnapshotError, QuickAccessPosition, QuickAccessSnapshot, RenderSnapshot,

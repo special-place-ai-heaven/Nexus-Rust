@@ -1,20 +1,121 @@
 //! Behavioral parity tests derived from the legacy C++ UI services.
 
+use core::num::NonZeroUsize;
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 use nexus_ui_host::{
-    AlertKind, AlertQueueConfig, ContextRegistrationOutcome, ESCAPE_VIRTUAL_KEY,
-    EscapeCloseOutcome, EscapeClosingConfig, EscapeKeyEvent, EscapeRegistrationOutcome,
-    FrameRenderState, NativeRenderCallback, NativeVisibilityPointer, NotificationBadge,
-    NotificationOutcome, OwnerGeneration, QA_GENERIC_KEY, QuickAccessConfig, QuickAccessPosition,
-    QuickAccessSettings, QuickAccessVisibility, RegisterRenderOutcome, RenderPhase,
-    RenderRegistryConfig, ShortcutRegistrationOutcome, UiCallback, UiHost, UiHostConfig,
-    UiRegistryError, VisibilityTarget,
+    AlertKind, AlertQueueConfig, CheckedVisibilityAccess, ContextRegistrationOutcome,
+    ESCAPE_VIRTUAL_KEY, EscapeCloseOutcome, EscapeClosingConfig, EscapeKeyEvent,
+    EscapeRegistrationOutcome, FrameRenderState, NativeRenderCallback, NativeVisibilityPointer,
+    NotificationBadge, NotificationOutcome, OwnerGeneration, QA_GENERIC_KEY, QuickAccessConfig,
+    QuickAccessPosition, QuickAccessSettings, QuickAccessVisibility, RegisterRenderOutcome,
+    RenderPhase, RenderRegistryConfig, ShortcutRegistrationOutcome, UiCallback, UiHost,
+    UiHostConfig, UiRegistryError, VisibilityTarget,
 };
 
 static NATIVE_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct TestVisibilityAccess {
+    visible: AtomicU8,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl TestVisibilityAccess {
+    fn new(visible: bool) -> Self {
+        Self {
+            visible: AtomicU8::new(u8::from(visible)),
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        }
+    }
+
+    fn address(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.visible.as_ptr() as usize).expect("atomic test cell is non-null")
+    }
+}
+
+// SAFETY: the adapter accepts only its own live `AtomicU8` allocation, uses
+// atomic synchronization for every access, and never re-enters a registry or
+// owner-cleanup path from either callback.
+unsafe impl CheckedVisibilityAccess for TestVisibilityAccess {
+    fn read_visible(&self, address: NonZeroUsize) -> Option<bool> {
+        if address != self.address() {
+            return None;
+        }
+        self.reads.fetch_add(1, Ordering::AcqRel);
+        Some(self.visible.load(Ordering::Acquire) != 0)
+    }
+
+    fn write_hidden(&self, address: NonZeroUsize) -> bool {
+        if address != self.address() {
+            return false;
+        }
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        self.visible.store(0, Ordering::Release);
+        true
+    }
+}
+
+struct BlockingVisibilityAccess {
+    visible: AtomicU8,
+    entered: Sender<()>,
+    release: (Mutex<bool>, Condvar),
+}
+
+impl BlockingVisibilityAccess {
+    fn new() -> (Arc<Self>, Receiver<()>) {
+        let (entered, observed) = mpsc::channel();
+        (
+            Arc::new(Self {
+                visible: AtomicU8::new(1),
+                entered,
+                release: (Mutex::new(false), Condvar::new()),
+            }),
+            observed,
+        )
+    }
+
+    fn address(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.visible.as_ptr() as usize).expect("atomic test cell is non-null")
+    }
+
+    fn release(&self) {
+        *lock(&self.release.0) = true;
+        self.release.1.notify_all();
+    }
+}
+
+// SAFETY: the adapter accepts only its own live `AtomicU8`, synchronizes all
+// accesses, and never re-enters the registry or owner-cleanup paths. The test
+// release gate only holds the adapter call open so concurrent entry is visible.
+unsafe impl CheckedVisibilityAccess for BlockingVisibilityAccess {
+    fn read_visible(&self, address: NonZeroUsize) -> Option<bool> {
+        if address != self.address() || self.entered.send(()).is_err() {
+            return None;
+        }
+        let mut released = lock(&self.release.0);
+        while !*released {
+            released = match self.release.1.wait(released) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        Some(self.visible.load(Ordering::Acquire) != 0)
+    }
+
+    fn write_hidden(&self, address: NonZeroUsize) -> bool {
+        if address != self.address() {
+            return false;
+        }
+        self.visible.store(0, Ordering::Release);
+        true
+    }
+}
 
 unsafe extern "C" fn count_native_callback() {
     NATIVE_CALLBACK_CALLS.fetch_add(1, Ordering::AcqRel);
@@ -287,14 +388,36 @@ fn escape_closes_topmost_once_and_preserves_first_duplicate_target() {
         EscapeCloseOutcome::Passed
     );
     host.escape_closing().set_enabled(true);
+    let foreign_owner = must(host.owner(OwnerGeneration::new(30, 1)));
+    assert!(
+        !host.escape_closing().deregister_target_for_owner(
+            &foreign_owner,
+            &VisibilityTarget::managed(Arc::clone(&a)),
+        )
+    );
     assert!(
         host.escape_closing()
-            .deregister_target(&VisibilityTarget::managed(Arc::clone(&a)))
+            .deregister_target_for_owner(&owner, &VisibilityTarget::managed(Arc::clone(&a)))
     );
     assert_eq!(
         host.escape_closing().registered_windows().as_ref(),
         &[Arc::<str>::from("B")]
     );
+    let trusted_target = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        must(host.escape_closing().register(
+            &owner,
+            "Trusted target",
+            VisibilityTarget::managed(Arc::clone(&trusted_target)),
+        )),
+        EscapeRegistrationOutcome::Registered
+    );
+    assert!(
+        host.escape_closing()
+            .deregister_target(&VisibilityTarget::managed(Arc::clone(&trusted_target)),)
+    );
+    assert!(host.escape_closing().deregister_window("B"));
+    assert!(host.escape_closing().registered_windows().is_empty());
 }
 
 #[test]
@@ -302,25 +425,33 @@ fn native_escape_pointer_is_only_touched_while_owner_is_active() {
     let host = UiHost::default();
     let identity = OwnerGeneration::new(4, 1);
     let owner = must(host.owner(identity));
-    let mut visible = 1_u8;
-    // SAFETY: this stack byte remains valid and exclusively accessed through
-    // the registry until owner cleanup reaches quiescence below.
-    let pointer =
-        match unsafe { NativeVisibilityPointer::from_ptr(owner.clone(), &raw mut visible) } {
-            Some(pointer) => pointer,
-            None => panic!("stack pointer cannot be null"),
-        };
-    let target = VisibilityTarget::native(pointer);
+    let access = Arc::new(TestVisibilityAccess::new(true));
+    let address = access.address();
     let other_host = UiHost::default();
     let other_owner = must(other_host.owner(identity));
+    let mismatched_pointer = unsafe {
+        // SAFETY: the adapter-owned atomic is live for this value, all accesses
+        // are atomic, and the adapter never re-enters registry cleanup.
+        NativeVisibilityPointer::checked(owner.clone(), address, access.clone())
+    };
     assert!(matches!(
-        other_host
-            .escape_closing()
-            .register(&other_owner, "Wrong gate", target.clone()),
+        other_host.escape_closing().register(
+            &other_owner,
+            "Wrong gate",
+            VisibilityTarget::native(mismatched_pointer),
+        ),
         Err(UiRegistryError::NativeOwnerMismatch { .. })
     ));
+    let pointer = unsafe {
+        // SAFETY: the adapter-owned atomic remains live through owner cleanup,
+        // all accesses are atomic, and the adapter cannot re-enter the registry.
+        NativeVisibilityPointer::checked(owner.clone(), address, access.clone())
+    };
     assert_eq!(
-        must(host.escape_closing().register(&owner, "Native", target)),
+        must(
+            host.escape_closing()
+                .register(&owner, "Native", VisibilityTarget::native(pointer),)
+        ),
         EscapeRegistrationOutcome::Registered
     );
     assert!(matches!(
@@ -328,10 +459,100 @@ fn native_escape_pointer_is_only_touched_while_owner_is_active() {
             .handle(event(false), &["Fallback", "Native"]),
         EscapeCloseOutcome::Consumed { .. }
     ));
-    assert_eq!(visible, 0);
+    assert_eq!(access.visible.load(Ordering::Acquire), 0);
+    assert_eq!(access.reads.load(Ordering::Acquire), 1);
+    assert_eq!(access.writes.load(Ordering::Acquire), 1);
+    access.visible.store(1, Ordering::Release);
     let cleanup = host.cleanup_owner_generation(identity);
     assert!(cleanup.retirement.quiescent);
     assert_eq!(cleanup.escape_windows, 1);
+    assert!(host.escape_closing().registered_windows().is_empty());
+    assert_eq!(
+        host.escape_closing()
+            .handle(event(false), &["Fallback", "Native"]),
+        EscapeCloseOutcome::Passed
+    );
+    assert_eq!(access.visible.load(Ordering::Acquire), 1);
+    assert_eq!(access.reads.load(Ordering::Acquire), 1);
+    assert_eq!(access.writes.load(Ordering::Acquire), 1);
+    let stale_pointer = unsafe {
+        // SAFETY: this new linear value owns an adapter Arc keeping the atomic
+        // allocation live; registration rejects its retired owner before use.
+        NativeVisibilityPointer::checked(owner.clone(), address, access.clone())
+    };
+    assert!(matches!(
+        host.escape_closing().register(
+            &owner,
+            "Stale",
+            VisibilityTarget::native(stale_pointer),
+        ),
+        Err(UiRegistryError::OwnerRetired(retired)) if retired == identity
+    ));
+    assert_eq!(access.reads.load(Ordering::Acquire), 1);
+    assert_eq!(access.writes.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn retained_native_cell_transactions_are_serial_across_escape_handlers() {
+    let host = Arc::new(UiHost::default());
+    let owner = must(host.owner(OwnerGeneration::new(4, 2)));
+    let (access, entered) = BlockingVisibilityAccess::new();
+    for window in ["Serial native one", "Serial native two"] {
+        let pointer = unsafe {
+            // SAFETY: the adapter owns the atomic for both registrations,
+            // synchronizes it, and does not re-enter either registration.
+            NativeVisibilityPointer::checked(owner.clone(), access.address(), access.clone())
+        };
+        assert_eq!(
+            must(
+                host.escape_closing()
+                    .register(&owner, window, VisibilityTarget::native(pointer),)
+            ),
+            EscapeRegistrationOutcome::Registered
+        );
+    }
+
+    let start = Arc::new(Barrier::new(3));
+    let mut handlers = Vec::new();
+    for window in ["Serial native one", "Serial native two"] {
+        let host = Arc::clone(&host);
+        let start = Arc::clone(&start);
+        handlers.push(std::thread::spawn(move || {
+            start.wait();
+            host.escape_closing()
+                .handle(event(false), &["Fallback", window])
+        }));
+    }
+    start.wait();
+
+    entered
+        .recv_timeout(Duration::from_secs(1))
+        .expect("one handler enters the retained adapter");
+    let concurrent_entry = entered.recv_timeout(Duration::from_millis(100)).is_ok();
+    access.release();
+
+    let outcomes = handlers
+        .into_iter()
+        .map(|handler| handler.join().expect("Escape handler completes"))
+        .collect::<Vec<_>>();
+    assert!(
+        !concurrent_entry,
+        "retained adapter was entered concurrently"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, EscapeCloseOutcome::Consumed { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, EscapeCloseOutcome::Passed))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -514,6 +735,141 @@ fn quick_access_cleanup_is_generation_exact_and_preserves_foreign_children() {
     assert_eq!(mutation.adopted_orphans, 1);
     let snapshot = host.quick_access().snapshot(true, false);
     assert_eq!(snapshot.shortcuts[0].context_items[0].owner, child_id);
+}
+
+#[test]
+fn quick_access_owner_scoped_removal_rejects_cross_owner() {
+    let host = UiHost::default();
+    let resource_owner = must(host.owner(OwnerGeneration::new(30, 1)));
+    let foreign_owner = must(host.owner(OwnerGeneration::new(31, 1)));
+    must(host.quick_access().add_shortcut(
+        &resource_owner,
+        "owned-shortcut",
+        "texture",
+        "hover",
+        "bind",
+        "tooltip",
+    ));
+    let callback = UiCallback::managed(resource_owner.clone(), || {});
+    assert_eq!(
+        must(
+            host.quick_access()
+                .add_context_item("owned-context", "owned-shortcut", callback,)
+        ),
+        ContextRegistrationOutcome::Attached
+    );
+
+    let before = host.quick_access().snapshot(true, false);
+    assert_eq!(
+        must(
+            host.quick_access()
+                .remove_context_item_for_owner(&foreign_owner, "owned-context")
+        ),
+        0
+    );
+    assert!(!must(
+        host.quick_access()
+            .remove_shortcut_for_owner(&foreign_owner, "owned-shortcut")
+    ));
+
+    let after = host.quick_access().snapshot(true, false);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.shortcuts.len(), 1);
+    assert_eq!(after.shortcuts[0].context_items.len(), 1);
+}
+
+#[test]
+fn quick_access_owner_scoped_removal_rejects_stale_generation() {
+    let host = UiHost::default();
+    let stale_identity = OwnerGeneration::new(32, 1);
+    let stale_owner = must(host.owner(stale_identity));
+    host.cleanup_owner_generation(stale_identity);
+
+    let active_owner = must(host.owner(OwnerGeneration::new(32, 2)));
+    must(host.quick_access().add_shortcut(
+        &active_owner,
+        "reloaded-shortcut",
+        "texture",
+        "hover",
+        "bind",
+        "tooltip",
+    ));
+    let callback = UiCallback::managed(active_owner, || {});
+    assert_eq!(
+        must(host.quick_access().add_context_item(
+            "reloaded-context",
+            "reloaded-shortcut",
+            callback,
+        )),
+        ContextRegistrationOutcome::Attached
+    );
+
+    let before = host.quick_access().snapshot(true, false);
+    assert!(matches!(
+        host.quick_access()
+            .remove_context_item_for_owner(&stale_owner, "reloaded-context"),
+        Err(UiRegistryError::OwnerRetired(owner)) if owner == stale_identity
+    ));
+    assert!(matches!(
+        host.quick_access()
+            .remove_shortcut_for_owner(&stale_owner, "reloaded-shortcut"),
+        Err(UiRegistryError::OwnerRetired(owner)) if owner == stale_identity
+    ));
+
+    let after = host.quick_access().snapshot(true, false);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.shortcuts.len(), 1);
+    assert_eq!(after.shortcuts[0].context_items.len(), 1);
+}
+
+#[test]
+fn quick_access_owner_scoped_removal_allows_same_owner() {
+    let host = UiHost::default();
+    let owner = must(host.owner(OwnerGeneration::new(33, 1)));
+    must(host.quick_access().add_shortcut(
+        &owner,
+        "owned-shortcut",
+        "texture",
+        "hover",
+        "bind",
+        "tooltip",
+    ));
+    let callback = UiCallback::managed(owner.clone(), || {});
+    assert_eq!(
+        must(host.quick_access().add_context_item(
+            "owned-context",
+            "owned-shortcut",
+            callback.clone(),
+        )),
+        ContextRegistrationOutcome::Attached
+    );
+    assert_eq!(
+        must(
+            host.quick_access()
+                .add_context_item("owned-context", "missing-shortcut", callback,)
+        ),
+        ContextRegistrationOutcome::Orphaned
+    );
+
+    let before = host.quick_access().snapshot(true, false);
+    assert_eq!(
+        must(
+            host.quick_access()
+                .remove_context_item_for_owner(&owner, "owned-context")
+        ),
+        2
+    );
+    let contexts_removed = host.quick_access().snapshot(true, false);
+    assert!(contexts_removed.revision > before.revision);
+    assert!(contexts_removed.shortcuts[0].context_items.is_empty());
+
+    assert!(must(
+        host.quick_access()
+            .remove_shortcut_for_owner(&owner, "owned-shortcut")
+    ));
+    let shortcut_removed = host.quick_access().snapshot(true, false);
+    assert!(shortcut_removed.revision > contexts_removed.revision);
+    assert!(shortcut_removed.shortcuts.is_empty());
 }
 
 #[test]

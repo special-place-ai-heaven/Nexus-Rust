@@ -8,4 +8,7 @@ mod events;
 pub use address_ownership::{AddressOwnershipError, AddressOwnershipIndex, AddressPublish};
 pub use callback_gate::{CallbackGate, CallbackGuard};
 pub use data_link::{DataLink, DataLinkError, ResourceHandle};
-pub use events::{CallbackId, DispatchReport, EventBus, EventHandler, OwnerToken, Subscription};
+pub use events::{
+    CallbackId, DispatchReport, EventBus, EventHandler, EventOwnerRetirement,
+    EventRegistrationError, OwnerToken, Subscription, SubscriptionToken,
+};

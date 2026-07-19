@@ -22,7 +22,7 @@ pub struct EscapeKeyEvent {
 }
 
 /// Visibility storage registered for one named window.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum VisibilityTarget {
     /// Safe Rust-owned visibility state.
     Managed(Arc<AtomicBool>),
@@ -60,13 +60,7 @@ impl VisibilityTarget {
     fn close_if_visible(&self) -> bool {
         match self {
             Self::Managed(visible) => visible.swap(false, Ordering::AcqRel),
-            Self::Native(pointer) => {
-                let was_visible = pointer.is_visible();
-                if was_visible {
-                    pointer.close();
-                }
-                was_visible
-            }
+            Self::Native(pointer) => pointer.close_if_visible(),
         }
     }
 }
@@ -289,7 +283,10 @@ impl EscapeClosingRegistry {
         Ok(EscapeRegistrationOutcome::Registered)
     }
 
-    /// Removes a registration by its window name.
+    /// Removes the first registration with this window name.
+    ///
+    /// This is a trusted host-wide administrative operation. Native add-on API
+    /// adapters should use [`Self::deregister_window_for_owner`] instead.
     pub fn deregister_window(&self, window: &str) -> bool {
         let entry = {
             let mut state = self.lock();
@@ -306,7 +303,28 @@ impl EscapeClosingRegistry {
         true
     }
 
-    /// Removes the first registration using a target, in registration order.
+    /// Removes this owner's registration by its window name.
+    pub fn deregister_window_for_owner(&self, owner: &OwnerHandle, window: &str) -> bool {
+        let Some(_activity) = owner.try_enter() else {
+            return false;
+        };
+        let entry = {
+            let mut state = self.lock();
+            let Some(index) = state.entries.iter().position(|entry| {
+                entry.owner.shares_lifecycle(owner) && entry.window.as_ref() == window
+            }) else {
+                return false;
+            };
+            state.entries.remove(index)
+        };
+        entry.deactivate_and_drain();
+        true
+    }
+
+    /// Removes the first registration using this target, in registration order.
+    ///
+    /// This is a trusted host-wide administrative operation. Native add-on API
+    /// adapters should use [`Self::deregister_target_for_owner`] instead.
     pub fn deregister_target(&self, target: &VisibilityTarget) -> bool {
         let identity = target.identity();
         let entry = {
@@ -316,6 +334,29 @@ impl EscapeClosingRegistry {
                 .iter()
                 .position(|entry| entry.target.identity() == identity)
             else {
+                return false;
+            };
+            state.entries.remove(index)
+        };
+        entry.deactivate_and_drain();
+        true
+    }
+
+    /// Removes this owner's first matching target, in registration order.
+    pub fn deregister_target_for_owner(
+        &self,
+        owner: &OwnerHandle,
+        target: &VisibilityTarget,
+    ) -> bool {
+        let Some(_activity) = owner.try_enter() else {
+            return false;
+        };
+        let identity = target.identity();
+        let entry = {
+            let mut state = self.lock();
+            let Some(index) = state.entries.iter().position(|entry| {
+                entry.owner.shares_lifecycle(owner) && entry.target.identity() == identity
+            }) else {
                 return false;
             };
             state.entries.remove(index)

@@ -26,7 +26,7 @@ pub use escape::{
     EscapeKeyEvent, EscapeRegistrationOutcome, VisibilityTarget,
 };
 pub use host::{UiHost, UiHostCleanup, UiHostConfig};
-pub use native::{NativeRenderCallback, NativeVisibilityPointer};
+pub use native::{CheckedVisibilityAccess, NativeRenderCallback, NativeVisibilityPointer};
 pub use owner::{OwnerGeneration, OwnerHandle, OwnerRetirement};
 pub use quick_access::{
     ContextMenuItemSnapshot, ContextRegistrationOutcome, NotificationBadge, NotificationOutcome,

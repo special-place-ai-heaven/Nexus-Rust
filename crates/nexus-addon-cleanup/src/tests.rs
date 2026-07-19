@@ -5,14 +5,17 @@ use crate::{
     RegistrationCleaner, RegistrationCleanerBuilder, StepFailure, StepStatus, TextureCallbacks,
     TypedAdapter, UiHostCallbacks,
 };
-use nexus_core::OwnerToken;
+use nexus_core::{CallbackId, EventHandler, OwnerToken};
+use nexus_data_services::EventService;
 use nexus_host::CleanupPhase;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::panic::panic_any;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 
 type CallLog = Rc<RefCell<Vec<(CleanupService, OwnerToken)>>>;
 
@@ -179,6 +182,95 @@ fn partial_phase_retry_calls_only_failed_slot_and_preserves_counts() {
         raw_status,
         Some(StepStatus::Complete {
             removed: 3,
+            attempts: 2,
+        })
+    );
+}
+
+#[test]
+fn event_adapter_reports_busy_until_the_retired_callback_frame_drains() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let service = Arc::new(EventService::new());
+    let owner = owner(101, 6);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let release_for_callback = Arc::clone(&release_rx);
+    let handler: Arc<EventHandler> = Arc::new(move |_| {
+        entered_tx
+            .send(())
+            .expect("entry receiver should remain live");
+        release_for_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv()
+            .expect("release sender should remain live");
+    });
+    service
+        .subscribe_handler(
+            owner,
+            "EV_CLEANUP_DRAIN",
+            CallbackId::new(1).expect("test callback ID is nonzero"),
+            handler,
+        )
+        .expect("event fixture should subscribe");
+    let dispatch_service = Arc::clone(&service);
+    let dispatch = thread::spawn(move || {
+        // SAFETY: the blocking test callback ignores its null payload.
+        unsafe { dispatch_service.raise("EV_CLEANUP_DRAIN", core::ptr::null_mut()) }
+            .expect("test event should dispatch")
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("event callback should enter");
+
+    let mut cleaner = configured_builder(&log)
+        .event_callbacks(crate::direct::events(Arc::clone(&service)))
+        .build();
+    cleaner
+        .cleanup_phase(owner, CleanupPhase::HookRegistrations)
+        .expect("hook phase should complete");
+    let first = cleaner
+        .cleanup_phase(owner, CleanupPhase::CallbackRegistrations)
+        .expect_err("active event callback must keep cleanup retryable");
+    let event_status = first
+        .report()
+        .steps()
+        .iter()
+        .find(|step| step.service() == CleanupService::EventCallbacks)
+        .map(|step| step.status());
+    assert_eq!(
+        event_status,
+        Some(StepStatus::Failed {
+            failure: StepFailure::Adapter(AdapterFailureKind::Busy),
+            removed: 1,
+            remaining: Some(1),
+            attempts: 1,
+        })
+    );
+
+    release_tx
+        .send(())
+        .expect("event callback should remain live");
+    assert_eq!(
+        dispatch
+            .join()
+            .expect("dispatch thread should not panic")
+            .invoked,
+        1
+    );
+    let retry = cleaner
+        .cleanup_phase(owner, CleanupPhase::CallbackRegistrations)
+        .expect("drained event callback should complete on retry");
+    let event_status = retry
+        .steps()
+        .iter()
+        .find(|step| step.service() == CleanupService::EventCallbacks)
+        .map(|step| step.status());
+    assert_eq!(
+        event_status,
+        Some(StepStatus::Complete {
+            removed: 1,
             attempts: 2,
         })
     );

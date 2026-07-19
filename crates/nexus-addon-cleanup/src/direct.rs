@@ -71,7 +71,16 @@ pub fn managed_input(service: Arc<ManagedInputBinds>) -> TypedAdapter<ManagedInp
 /// Adapts the event subscription service.
 #[must_use]
 pub fn events(service: Arc<EventService>) -> TypedAdapter<EventCallbacks> {
-    TypedAdapter::new(move |owner| Ok(CleanupEffect::complete(service.cleanup_owner(owner))))
+    TypedAdapter::new(move |owner| {
+        let report = service.cleanup_owner(owner);
+        if report.quiescent() {
+            Ok(CleanupEffect::complete(report.retired()))
+        } else {
+            Err(AdapterError::new(AdapterFailureKind::Busy)
+                .with_removed(report.retired())
+                .with_remaining(report.in_flight()))
+        }
+    })
 }
 
 /// Adapts the texture callback/request registry.

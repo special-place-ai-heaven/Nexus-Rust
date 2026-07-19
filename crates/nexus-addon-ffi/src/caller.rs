@@ -73,6 +73,11 @@ impl AddonCallerResolver {
     /// `function_hint` is an optional non-null function address already copied
     /// from the native ABI. This method never dereferences, formats, or stores
     /// it. The injected ownership resolver is the validation authority.
+    ///
+    /// A validated hint is intentionally a compatibility attribution source,
+    /// not proof that the owner supplied the hint. Authorization paths that
+    /// accept a caller-controlled function address must use
+    /// [`Self::resolve_registered_address`] instead.
     #[must_use]
     pub fn resolve(&self, function_hint: Option<NonZeroUsize>) -> Option<OwnerToken> {
         contain_panic(|| self.resolve_inner(function_hint)).unwrap_or_default()
@@ -87,6 +92,83 @@ impl AddonCallerResolver {
             }
         }
 
+        self.resolve_actual_inner()
+    }
+
+    /// Resolves the actual live caller without trusting a supplied address.
+    ///
+    /// Explicit callback scopes are checked first, followed by native stack
+    /// capture. This is the authority source for owner-scoped mutations.
+    #[must_use]
+    pub fn resolve_actual(&self) -> Option<OwnerToken> {
+        contain_panic(|| self.resolve_actual_inner()).unwrap_or_default()
+    }
+
+    /// Authenticates a caller-controlled registered function address.
+    ///
+    /// The actual caller is resolved independently from TLS/stack state. The
+    /// supplied address is then mapped exactly and must belong to the same
+    /// current owner generation. The address is never dereferenced or logged.
+    #[must_use]
+    pub fn resolve_registered_address(&self, address: NonZeroUsize) -> Option<OwnerToken> {
+        contain_panic(|| self.resolve_registered_address_inner(address)).unwrap_or_default()
+    }
+
+    /// Returns whether an opaque native address belongs to one exact current
+    /// addon generation.
+    ///
+    /// The address is never dereferenced, retained, or formatted. This method
+    /// is intended for validating retained data addresses after the caller was
+    /// independently authenticated.
+    #[must_use]
+    pub fn address_belongs_to_owner(&self, address: NonZeroUsize, owner: OwnerToken) -> bool {
+        contain_panic(
+            || matches!(self.validated_address(address), Ok(Some(found)) if found == owner),
+        )
+        .unwrap_or(false)
+    }
+
+    /// Checks whether a retained data address is compatible with one live
+    /// owner generation.
+    ///
+    /// Addon-image addresses are authoritative: a range mapped to another
+    /// generation is rejected, including a closed generation whose mapping is
+    /// retained until unload. An address absent from the addon-image index is
+    /// admitted for legacy heap and TLS compatibility. That compatibility case
+    /// deliberately does not prove allocation ownership or lifetime; the
+    /// unsafe retained-pointer API must carry those obligations. Resolver
+    /// panics and retired owners always fail closed.
+    #[must_use]
+    pub fn retained_address_allowed_for_owner(
+        &self,
+        address: NonZeroUsize,
+        owner: OwnerToken,
+    ) -> bool {
+        contain_panic(|| {
+            if !self.address_owners.is_current_owner(owner) {
+                return false;
+            }
+            match self.address_owners.owner_for_address(address) {
+                Some(mapped) => mapped == owner,
+                None => true,
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Returns whether an exact owner generation still accepts addon API calls.
+    #[must_use]
+    pub fn is_current_owner(&self, owner: OwnerToken) -> bool {
+        contain_panic(|| matches!(self.owner_is_current(owner), Ok(true))).unwrap_or(false)
+    }
+
+    fn resolve_registered_address_inner(&self, address: NonZeroUsize) -> Option<OwnerToken> {
+        let actual = self.resolve_actual_inner()?;
+        let registered = self.validated_address(address).ok()??;
+        (actual == registered).then_some(actual)
+    }
+
+    fn resolve_actual_inner(&self) -> Option<OwnerToken> {
         match current_scoped_owner() {
             Ok(Some(owner)) => match self.owner_is_current(owner) {
                 Ok(true) => return Some(owner),
@@ -439,6 +521,70 @@ mod tests {
         assert_eq!(caller.resolve(Some(address(0x40))), Some(scope_owner));
         drop(scope);
         assert_eq!(caller.resolve(Some(address(0x40))), Some(stack_owner));
+    }
+
+    #[test]
+    fn registered_address_requires_the_independently_resolved_owner_generation() {
+        let owners = Arc::new(TestAddressOwners::default());
+        let actual = owner(10, 4);
+        let other = owner(11, 2);
+        let stale_actual = owner(actual.signature, actual.generation - 1);
+        owners.map(address(0x10), other);
+        owners.map(address(0x20), stale_actual);
+        owners.map(address(0x30), actual);
+        owners.set_current([actual, other]);
+        let caller =
+            AddonCallerResolver::with_stack_capture(owners.injected(), fixed_capture([0x30]));
+
+        let scope = enter_scope(&caller, actual);
+        assert_eq!(caller.resolve_actual(), Some(actual));
+        assert_eq!(caller.resolve_registered_address(address(0x10)), None);
+        assert_eq!(caller.resolve_registered_address(address(0x20)), None);
+        assert!(!caller.address_belongs_to_owner(address(0x10), actual));
+        assert!(!caller.address_belongs_to_owner(address(0x20), actual));
+        assert!(caller.address_belongs_to_owner(address(0x30), actual));
+        assert!(caller.is_current_owner(actual));
+        assert_eq!(
+            caller.resolve_registered_address(address(0x30)),
+            Some(actual)
+        );
+        assert_eq!(caller.resolve_registered_address(address(0x40)), None);
+        drop(scope);
+
+        owners.set_current([other]);
+        assert!(!caller.is_current_owner(actual));
+        owners.set_current([actual, other]);
+
+        assert_eq!(caller.resolve_actual(), Some(actual));
+        assert_eq!(
+            caller.resolve_registered_address(address(0x30)),
+            Some(actual)
+        );
+    }
+
+    #[test]
+    fn retained_addresses_allow_unmapped_storage_but_fail_closed_for_foreign_or_untrusted_state() {
+        let owners = Arc::new(TestAddressOwners::default());
+        let actual = owner(12, 4);
+        let other = owner(13, 2);
+        owners.map(address(0x10), actual);
+        owners.map(address(0x20), other);
+        owners.set_current([actual, other]);
+        let caller = AddonCallerResolver::new(owners.injected());
+
+        assert!(caller.retained_address_allowed_for_owner(address(0x10), actual));
+        assert!(!caller.retained_address_allowed_for_owner(address(0x20), actual));
+        assert!(caller.retained_address_allowed_for_owner(address(0x30), actual));
+
+        owners.set_current([other]);
+        assert!(!caller.retained_address_allowed_for_owner(address(0x30), actual));
+        owners.set_current([actual, other]);
+
+        owners.panic_lookup.store(true, Ordering::SeqCst);
+        assert!(!caller.retained_address_allowed_for_owner(address(0x30), actual));
+        owners.panic_lookup.store(false, Ordering::SeqCst);
+        owners.panic_current.store(true, Ordering::SeqCst);
+        assert!(!caller.retained_address_allowed_for_owner(address(0x30), actual));
     }
 
     #[test]

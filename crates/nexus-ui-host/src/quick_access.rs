@@ -421,7 +421,9 @@ impl QuickAccessRegistry {
         })
     }
 
-    /// Removes a shortcut and moves its surviving context items to orphans.
+    /// Trusted host-wide removal that moves surviving context items to orphans.
+    ///
+    /// Addon-facing boundaries must use [`Self::remove_shortcut_for_owner`].
     pub fn remove_shortcut(&self, id: &str) -> Result<bool, UiRegistryError> {
         self.validate_string("shortcut identifier", id)?;
         let mut state = self.lock();
@@ -438,6 +440,38 @@ impl QuickAccessRegistry {
         }
         state.revision = state.revision.saturating_add(1);
         Ok(did_remove)
+    }
+
+    /// Removes a shortcut only when it belongs to the active exact owner generation.
+    pub fn remove_shortcut_for_owner(
+        &self,
+        owner: &OwnerHandle,
+        id: &str,
+    ) -> Result<bool, UiRegistryError> {
+        self.validate_string("shortcut identifier", id)?;
+        let Some(_activity) = owner.try_enter() else {
+            return Err(UiRegistryError::OwnerRetired(owner.identity()));
+        };
+        let mut state = self.lock();
+        let is_owned = state.shortcuts.get(id).is_some_and(|shortcut| {
+            shortcut.owner.identity() == owner.identity() && shortcut.owner.shares_lifecycle(owner)
+        });
+        if !is_owned {
+            return Ok(false);
+        }
+
+        let Some(shortcut) = state.shortcuts.remove(id) else {
+            return Ok(false);
+        };
+        for (item_id, item) in shortcut.context_items {
+            if state.orphans.contains_key(item_id.as_ref()) {
+                item.callback.deactivate();
+            } else {
+                state.orphans.insert(item_id, item);
+            }
+        }
+        state.revision = state.revision.saturating_add(1);
+        Ok(true)
     }
 
     /// Adds a context item to the built-in Nexus menu shortcut.
@@ -493,7 +527,9 @@ impl QuickAccessRegistry {
         Ok(outcome)
     }
 
-    /// Removes an item ID from every shortcut and from the orphanage.
+    /// Trusted host-wide removal from every shortcut and from the orphanage.
+    ///
+    /// Addon-facing boundaries must use [`Self::remove_context_item_for_owner`].
     pub fn remove_context_item(&self, id: &str) -> Result<usize, UiRegistryError> {
         self.validate_string("context item identifier", id)?;
         let mut state = self.lock();
@@ -509,6 +545,44 @@ impl QuickAccessRegistry {
             removed += 1;
         }
         state.revision = state.revision.saturating_add(1);
+        Ok(removed)
+    }
+
+    /// Removes matching context items owned by the active exact owner generation.
+    pub fn remove_context_item_for_owner(
+        &self,
+        owner: &OwnerHandle,
+        id: &str,
+    ) -> Result<usize, UiRegistryError> {
+        self.validate_string("context item identifier", id)?;
+        let Some(_activity) = owner.try_enter() else {
+            return Err(UiRegistryError::OwnerRetired(owner.identity()));
+        };
+        let owner_identity = owner.identity();
+        let mut state = self.lock();
+        let mut removed = 0;
+        for shortcut in state.shortcuts.values_mut() {
+            let is_owned = shortcut.context_items.get(id).is_some_and(|item| {
+                let callback_owner = item.callback.owner_handle();
+                callback_owner.identity() == owner_identity
+                    && callback_owner.shares_lifecycle(owner)
+            });
+            if is_owned && let Some(item) = shortcut.context_items.remove(id) {
+                item.callback.deactivate();
+                removed += 1;
+            }
+        }
+        let orphan_is_owned = state.orphans.get(id).is_some_and(|item| {
+            let callback_owner = item.callback.owner_handle();
+            callback_owner.identity() == owner_identity && callback_owner.shares_lifecycle(owner)
+        });
+        if orphan_is_owned && let Some(item) = state.orphans.remove(id) {
+            item.callback.deactivate();
+            removed += 1;
+        }
+        if removed > 0 {
+            state.revision = state.revision.saturating_add(1);
+        }
         Ok(removed)
     }
 

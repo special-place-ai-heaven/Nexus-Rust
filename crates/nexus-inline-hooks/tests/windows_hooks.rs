@@ -7,8 +7,9 @@ use std::{
     hint::black_box,
     ptr,
     sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicI32, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        mpsc::sync_channel,
     },
 };
 
@@ -108,6 +109,25 @@ fn exact_statuses_trampoline_and_single_hook_lifecycle() {
     let target = function_pointer(target_a);
     let detour = function_pointer(detour_a);
 
+    assert_eq!(
+        service.preflight_create(target, detour),
+        MH_ERROR_NOT_INITIALIZED
+    );
+    assert_eq!(
+        service.preflight_remove(ptr::null_mut()),
+        MH_ERROR_NOT_INITIALIZED
+    );
+    let mut unchanged = target;
+    let uninitialized_create = unsafe {
+        // SAFETY: null endpoints are rejected while the output remains writable.
+        service.create_hook(owner(1), ptr::null_mut(), ptr::null_mut(), &mut unchanged)
+    };
+    assert_eq!(uninitialized_create, MH_ERROR_NOT_INITIALIZED);
+    assert_eq!(unchanged, target);
+    assert_eq!(
+        service.remove_hook(ptr::null_mut()),
+        MH_ERROR_NOT_INITIALIZED
+    );
     assert_eq!(service.remove_hook(target), MH_ERROR_NOT_INITIALIZED);
     assert_eq!(
         service.enable_hook(ptr::null_mut()),
@@ -115,6 +135,18 @@ fn exact_statuses_trampoline_and_single_hook_lifecycle() {
     );
     assert_eq!(service.initialize(), MH_OK);
     assert_eq!(service.initialize(), MH_ERROR_ALREADY_INITIALIZED);
+    assert_eq!(
+        service.preflight_create(ptr::null_mut(), detour),
+        MH_ERROR_NOT_EXECUTABLE
+    );
+    assert_eq!(
+        service.preflight_create(target, ptr::null_mut()),
+        MH_ERROR_NOT_EXECUTABLE
+    );
+    assert_eq!(
+        service.preflight_remove(ptr::null_mut()),
+        MH_ERROR_NOT_CREATED
+    );
 
     let mut original = ptr::null_mut();
     let status = unsafe {
@@ -151,6 +183,125 @@ fn exact_statuses_trampoline_and_single_hook_lifecycle() {
     assert_eq!(service.remove_hook(target), MH_ERROR_NOT_CREATED);
     assert_eq!(service.uninitialize(), MH_OK);
     assert_eq!(service.uninitialize(), MH_ERROR_NOT_INITIALIZED);
+}
+
+#[test]
+fn cleanup_before_create_closes_only_retired_generations() {
+    let _test = serialize_tests();
+    let service = InlineHookService::new();
+    let retired = owner(40);
+    let reloaded = owner(41);
+    assert_eq!(service.initialize(), MH_OK);
+
+    let report = service
+        .cleanup_owner(retired)
+        .expect("empty exact-owner cleanup should succeed");
+    assert_eq!(report.retired(), 0);
+
+    let published = AtomicBool::new(false);
+    for closed in [owner(39), retired] {
+        let stale_status = unsafe {
+            // SAFETY: the functions share an ABI/signature and process lifetime.
+            service.create_hook_transaction(
+                closed,
+                function_pointer(target_b),
+                function_pointer(detour_b),
+                |_| {
+                    published.store(true, Ordering::Release);
+                    MH_OK
+                },
+            )
+        };
+        assert_eq!(stale_status, MH_ERROR_UNSUPPORTED_FUNCTION);
+    }
+    assert!(!published.load(Ordering::Acquire));
+    assert_eq!(service.hook_count(), 0);
+    assert!(format!("{service:?}").contains("retired_signature_count: 1"));
+
+    let reload_status = unsafe {
+        // SAFETY: the newer generation uses the same compatible live functions.
+        service.create_hook_transaction(
+            reloaded,
+            function_pointer(target_b),
+            function_pointer(detour_b),
+            |_| MH_OK,
+        )
+    };
+    assert_eq!(reload_status, MH_OK);
+    assert_eq!(service.owned_hook_count(reloaded), 1);
+    service
+        .cleanup_owner(reloaded)
+        .expect("reloaded generation cleanup should succeed");
+}
+
+#[test]
+fn cleanup_after_create_waits_through_trampoline_publication() {
+    let _test = serialize_tests();
+    let service = Arc::new(InlineHookService::new());
+    let target_owner = owner(50);
+    assert_eq!(service.initialize(), MH_OK);
+
+    let (publisher_entered_tx, publisher_entered_rx) = sync_channel(0);
+    let (release_publisher_tx, release_publisher_rx) = sync_channel(0);
+    let (cleanup_started_tx, cleanup_started_rx) = sync_channel(0);
+    let cleanup_done = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|scope| {
+        let creator_service = Arc::clone(&service);
+        let creator = scope.spawn(move || unsafe {
+            // SAFETY: the functions share an ABI/signature and process lifetime.
+            creator_service.create_hook_transaction(
+                target_owner,
+                function_pointer(target_c),
+                function_pointer(detour_c),
+                |trampoline| {
+                    assert!(!trampoline.is_null());
+                    publisher_entered_tx
+                        .send(())
+                        .expect("test coordinator should receive publication entry");
+                    release_publisher_rx
+                        .recv()
+                        .expect("test coordinator should release publication");
+                    MH_OK
+                },
+            )
+        });
+
+        publisher_entered_rx
+            .recv()
+            .expect("creator should enter trampoline publication");
+        let cleanup_service = Arc::clone(&service);
+        let cleanup_done_flag = Arc::clone(&cleanup_done);
+        let cleanup = scope.spawn(move || {
+            cleanup_started_tx
+                .send(())
+                .expect("test coordinator should receive cleanup start");
+            let result = cleanup_service.cleanup_owner(target_owner);
+            cleanup_done_flag.store(true, Ordering::Release);
+            result
+        });
+        cleanup_started_rx
+            .recv()
+            .expect("cleanup should reach the transaction boundary");
+        std::thread::yield_now();
+        assert!(!cleanup_done.load(Ordering::Acquire));
+
+        release_publisher_tx
+            .send(())
+            .expect("creator should still await publication release");
+        assert_eq!(
+            creator.join().expect("creator thread should not panic"),
+            MH_OK
+        );
+        let report = cleanup
+            .join()
+            .expect("cleanup thread should not panic")
+            .expect("cleanup should succeed after publication");
+        assert_eq!(report.retired(), 1);
+    });
+
+    assert!(cleanup_done.load(Ordering::Acquire));
+    assert_eq!(service.hook_count(), 0);
 }
 
 #[test]
