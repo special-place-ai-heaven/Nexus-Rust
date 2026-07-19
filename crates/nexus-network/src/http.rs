@@ -13,14 +13,8 @@ use crate::filesystem::{FileSystem, FileSystemError};
 
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Legacy default cache lifetime used for ordinary hosts.
+/// Default cache lifetime for callers that do not provide a stricter policy.
 pub const DEFAULT_CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
-
-/// Legacy cache lifetime used for `api.raidcore.gg`.
-pub const RAIDCORE_API_CACHE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-
-/// Legacy cache lifetime used for `api.github.com`.
-pub const GITHUB_API_CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// A validated HTTP or HTTPS origin.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -83,16 +77,6 @@ impl BaseUrl {
 impl fmt::Debug for BaseUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("BaseUrl([redacted])")
-    }
-}
-
-/// Returns the host-specific cache lifetime configured by the C++ network context.
-#[must_use]
-pub fn legacy_cache_max_age(base_url: &BaseUrl) -> Duration {
-    match base_url.as_str() {
-        "https://api.raidcore.gg" => RAIDCORE_API_CACHE_MAX_AGE,
-        "https://api.github.com" => GITHUB_API_CACHE_MAX_AGE,
-        _ => DEFAULT_CACHE_MAX_AGE,
     }
 }
 
@@ -438,7 +422,7 @@ impl<T, C, S> HttpClient<T, C, S> {
 }
 
 impl<T: Transport, C: Clock, S: CacheStore> HttpClient<T, C, S> {
-    /// Executes a bounded GET with legacy-compatible caching semantics.
+    /// Executes a bounded GET with a caller-selected cache policy.
     pub fn get(
         &mut self,
         endpoint: &str,
@@ -713,9 +697,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BaseUrl, ClientError, DownloadError, HttpClient, HttpClientConfig, HttpRequest,
-        RequestError, Transport, TransportError, TransportResponse, legacy_cache_max_age,
-        status_message,
+        BaseUrl, ClientError, DEFAULT_CACHE_MAX_AGE, DownloadError, HttpClient, HttpClientConfig,
+        HttpRequest, RequestError, Transport, TransportError, TransportResponse, status_message,
     };
     use crate::cache::{CachePolicy, CacheStore, CacheStoreError, HttpCache, MemoryCacheStore};
     use crate::clock::Clock;
@@ -792,21 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_host_cache_lifetimes_are_preserved() {
-        let raidcore = BaseUrl::parse("https://api.raidcore.gg");
-        let github = BaseUrl::parse("https://api.github.com");
-        let ordinary = BaseUrl::parse("https://example.test");
-        let (Ok(raidcore), Ok(github), Ok(ordinary)) = (raidcore, github, ordinary) else {
-            panic!("test origins must be valid");
-        };
-
-        assert_eq!(legacy_cache_max_age(&raidcore), Duration::from_secs(300));
-        assert_eq!(legacy_cache_max_age(&github), Duration::from_secs(3_600));
-        assert_eq!(legacy_cache_max_age(&ordinary), Duration::from_secs(1_800));
+    fn default_cache_lifetime_is_host_neutral() {
+        assert_eq!(DEFAULT_CACHE_MAX_AGE, Duration::from_secs(1_800));
     }
 
     #[test]
-    fn get_builds_the_legacy_query_and_reuses_a_fresh_cache_entry() {
+    fn get_builds_the_query_and_reuses_a_fresh_cache_entry() {
         let transport = ScriptedTransport::with_responses([Ok(TransportResponse::new(
             200,
             b"body".to_vec(),

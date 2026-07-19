@@ -14,8 +14,12 @@ use crate::clock::Clock;
 use crate::filesystem::{FileSystem, FileSystemError};
 use crate::http::{BaseUrl, BodyDecodeError, ClientError, HttpClient, RequestError, Transport};
 
-/// Legacy Nexus update metadata endpoint path.
-pub const NEXUS_VERSION_ENDPOINT: &str = "/nexusversion";
+/// GitHub API origin used for Nexus-Rust release discovery.
+pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
+/// GitHub API endpoint for the latest Nexus-Rust release.
+pub const NEXUS_RUST_LATEST_RELEASE_ENDPOINT: &str =
+    "/repos/special-place-ai-heaven/Nexus-Rust/releases/latest";
 
 /// Four-component Nexus version ordered lexicographically.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -80,39 +84,59 @@ impl FromStr for Version {
 #[error("invalid Nexus version")]
 pub struct VersionParseError;
 
-/// Parsed response from the Nexus version service.
+/// Parsed metadata from a Nexus-Rust GitHub release.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseMetadata {
     /// Remote release version.
     pub version: Version,
     /// Optional release notes supplied by the service.
     pub changelog: Option<String>,
+    download_source: Box<DownloadSource>,
 }
 
 impl ReleaseMetadata {
-    /// Parses the legacy uppercase-field JSON contract.
+    /// Parses the subset of GitHub release JSON used for update discovery.
     pub fn from_json(bytes: &[u8]) -> Result<Self, MetadataError> {
         let wire: ReleaseMetadataWire =
             serde_json::from_slice(bytes).map_err(|_error| MetadataError::InvalidJson)?;
+        let version = wire
+            .tag_name
+            .parse()
+            .map_err(|_error| MetadataError::InvalidVersion)?;
+        let asset = wire
+            .assets
+            .into_iter()
+            .find(|asset| asset.name == "d3d11.dll")
+            .ok_or(MetadataError::MissingSelfUpdateAsset)?;
+        let download_source = DownloadSource::parse(&asset.browser_download_url)
+            .map_err(|_error| MetadataError::InvalidAssetUrl)?;
         Ok(Self {
-            version: Version::new(wire.major, wire.minor, wire.build, wire.revision),
-            changelog: wire.changelog,
+            version,
+            changelog: wire.body,
+            download_source: Box::new(download_source),
         })
+    }
+
+    /// Returns the exact self-update asset selected from this release response.
+    #[must_use]
+    pub const fn download_source(&self) -> &DownloadSource {
+        &self.download_source
     }
 }
 
 #[derive(Deserialize)]
 struct ReleaseMetadataWire {
-    #[serde(rename = "Major")]
-    major: u16,
-    #[serde(rename = "Minor")]
-    minor: u16,
-    #[serde(rename = "Build")]
-    build: u16,
-    #[serde(rename = "Revision")]
-    revision: u16,
-    #[serde(rename = "Changelog", default)]
-    changelog: Option<String>,
+    tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    assets: Vec<ReleaseAssetWire>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseAssetWire {
+    name: String,
+    browser_download_url: String,
 }
 
 /// A redaction-safe update metadata parsing failure.
@@ -121,6 +145,15 @@ pub enum MetadataError {
     /// The service response did not match the metadata JSON contract.
     #[error("update metadata was invalid")]
     InvalidJson,
+    /// The release tag was not a supported Nexus version.
+    #[error("update metadata contained an invalid version")]
+    InvalidVersion,
+    /// The release did not contain the required drop-in DLL.
+    #[error("update metadata did not contain the self-update asset")]
+    MissingSelfUpdateAsset,
+    /// The required drop-in DLL had an invalid download URL.
+    #[error("update metadata contained an invalid self-update URL")]
+    InvalidAssetUrl,
 }
 
 /// Fetches metadata while bypassing and invalidating any cached copy.
@@ -219,15 +252,10 @@ impl fmt::Debug for DownloadSource {
     }
 }
 
-/// Returns the two legacy self-update download sources in fallback order.
-pub fn legacy_self_update_sources() -> Result<Vec<DownloadSource>, RequestError> {
-    [
-        "https://github.com/RaidcoreGG/Nexus/releases/latest/download/d3d11.dll",
-        "https://api.raidcore.gg/d3d11.dll",
-    ]
-    .into_iter()
-    .map(DownloadSource::parse)
-    .collect()
+/// Returns the exact asset selected from a fetched release response.
+#[must_use]
+pub fn self_update_sources(release: &ReleaseMetadata) -> Vec<DownloadSource> {
+    vec![release.download_source.as_ref().clone()]
 }
 
 /// Builds the GitHub API endpoint used to enumerate an add-on's releases.
@@ -626,7 +654,6 @@ pub enum SelfUpdateDecision {
 pub fn plan_self_update(
     current: Version,
     release: ReleaseMetadata,
-    sources: Vec<DownloadSource>,
     replacement: ReplacementPlan,
     max_bytes: usize,
 ) -> Result<SelfUpdateDecision, PlanError> {
@@ -636,6 +663,7 @@ pub fn plan_self_update(
     if release.version < current {
         return Ok(SelfUpdateDecision::RemoteOlder);
     }
+    let sources = self_update_sources(&release);
     let download = DownloadPlan::replacement(sources, replacement, max_bytes)?;
     Ok(SelfUpdateDecision::Available { release, download })
 }
@@ -860,12 +888,12 @@ mod tests {
 
     use super::{
         CommitError, CommitOutcome, DigestParseError, DownloadAttemptError, DownloadPlan,
-        DownloadSource, Md5Digest, PlanError, PlannedDownloader, ReleaseMetadata, ReplacementError,
-        ReplacementPlan, SelfUpdateDecision, Version, apply_replacement, commit_download,
-        direct_addon_update_available, fetch_release_metadata, github_latest_release_endpoint,
-        github_releases_endpoint, legacy_direct_checksum_sources, legacy_self_update_sources,
+        DownloadSource, Md5Digest, MetadataError, PlanError, PlannedDownloader, ReleaseMetadata,
+        ReplacementError, ReplacementPlan, SelfUpdateDecision, Version, apply_replacement,
+        commit_download, direct_addon_update_available, fetch_release_metadata,
+        github_latest_release_endpoint, github_releases_endpoint, legacy_direct_checksum_sources,
         plan_self_update, select_github_addon_update, select_latest_github_dll,
-        stage_with_fallback,
+        self_update_sources, stage_with_fallback,
     };
     use crate::clock::Clock;
     use crate::http::{HttpClient, HttpRequest, Transport, TransportError, TransportResponse};
@@ -901,17 +929,32 @@ mod tests {
     }
 
     #[test]
-    fn metadata_parser_preserves_the_legacy_uppercase_contract() {
+    fn metadata_parser_accepts_the_github_release_contract() {
         let metadata = ReleaseMetadata::from_json(
-            br#"{"Major":1,"Minor":2,"Build":3,"Revision":4,"Changelog":"notes"}"#,
+            br#"{"tag_name":"v1.2.3.4","body":"notes","assets":[{"name":"d3d11.dll","browser_download_url":"https://github.com/special-place-ai-heaven/Nexus-Rust/releases/download/v1.2.3.4/d3d11.dll"}]}"#,
         );
         let Ok(metadata) = metadata else {
             panic!("expected valid metadata");
         };
         assert_eq!(metadata.version, Version::new(1, 2, 3, 4));
         assert_eq!(metadata.changelog.as_deref(), Some("notes"));
+        assert_eq!(
+            metadata.download_source().target(),
+            "/special-place-ai-heaven/Nexus-Rust/releases/download/v1.2.3.4/d3d11.dll"
+        );
 
-        assert!(ReleaseMetadata::from_json(br#"{"Major":1}"#).is_err());
+        assert!(ReleaseMetadata::from_json(br#"{"tag_name":"invalid"}"#).is_err());
+        assert!(ReleaseMetadata::from_json(br#"{"body":"missing tag"}"#).is_err());
+        assert!(matches!(
+            ReleaseMetadata::from_json(br#"{"tag_name":"v1.2.3.4","assets":[]}"#),
+            Err(MetadataError::MissingSelfUpdateAsset)
+        ));
+        assert!(matches!(
+            ReleaseMetadata::from_json(
+                br#"{"tag_name":"v1.2.3.4","assets":[{"name":"d3d11.dll","browser_download_url":"not-a-url"}]}"#,
+            ),
+            Err(MetadataError::InvalidAssetUrl)
+        ));
     }
 
     #[derive(Clone, Copy)]
@@ -940,28 +983,33 @@ mod tests {
     }
 
     #[test]
-    fn metadata_fetch_uses_the_legacy_endpoint_without_internet() {
+    fn metadata_fetch_uses_the_nexus_rust_github_endpoint_without_internet() {
         let transport = MetadataTransport {
             response: Some(TransportResponse::new(
                 200,
-                br#"{"Major":2,"Minor":3,"Build":4,"Revision":5}"#.to_vec(),
+                br#"{"tag_name":"v2.3.4.5","body":null,"assets":[{"name":"d3d11.dll","browser_download_url":"https://github.com/special-place-ai-heaven/Nexus-Rust/releases/download/v2.3.4.5/d3d11.dll"}]}"#.to_vec(),
                 None,
             )),
             requested_target: None,
         };
-        let client = HttpClient::new("https://api.raidcore.gg", transport, FixedClock);
+        let client = HttpClient::new(super::GITHUB_API_BASE_URL, transport, FixedClock);
         let Ok(mut client) = client else {
             panic!("test client must be valid");
         };
 
-        let metadata = fetch_release_metadata(&mut client, super::NEXUS_VERSION_ENDPOINT);
+        let metadata =
+            fetch_release_metadata(&mut client, super::NEXUS_RUST_LATEST_RELEASE_ENDPOINT);
         let Ok(metadata) = metadata else {
             panic!("expected valid update metadata");
         };
         assert_eq!(metadata.version, Version::new(2, 3, 4, 5));
         assert_eq!(
+            metadata.download_source().target(),
+            "/special-place-ai-heaven/Nexus-Rust/releases/download/v2.3.4.5/d3d11.dll"
+        );
+        assert_eq!(
             client.transport_mut().requested_target.as_deref(),
-            Some("/nexusversion")
+            Some("/repos/special-place-ai-heaven/Nexus-Rust/releases/latest")
         );
     }
 
@@ -1037,14 +1085,20 @@ mod tests {
     }
 
     #[test]
-    fn self_update_sources_keep_github_then_raidcore_fallback_order() {
-        let sources = legacy_self_update_sources();
-        let Ok(sources) = sources else {
-            panic!("legacy constants must be valid URLs");
+    fn self_update_sources_only_install_project_owned_releases() {
+        let metadata = ReleaseMetadata::from_json(
+            br#"{"tag_name":"v1.2.3.4","assets":[{"name":"d3d11.dll","browser_download_url":"https://github.com/special-place-ai-heaven/Nexus-Rust/releases/download/v1.2.3.4/d3d11.dll"}]}"#,
+        );
+        let Ok(metadata) = metadata else {
+            panic!("project release metadata must be valid");
         };
-        assert_eq!(sources.len(), 2);
+        let sources = self_update_sources(&metadata);
+        assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].base_url().as_str(), "https://github.com");
-        assert_eq!(sources[1].base_url().as_str(), "https://api.raidcore.gg");
+        assert_eq!(
+            sources[0].target(),
+            "/special-place-ai-heaven/Nexus-Rust/releases/download/v1.2.3.4/d3d11.dll"
+        );
     }
 
     #[test]
@@ -1072,45 +1126,30 @@ mod tests {
         let equal = ReleaseMetadata {
             version: current,
             changelog: None,
+            download_source: Box::new(source("https://files.test/nexus.dll")),
         };
         assert_eq!(
-            plan_self_update(
-                current,
-                equal,
-                vec![source("https://files.test/nexus.dll")],
-                replacement(),
-                1024
-            ),
+            plan_self_update(current, equal, replacement(), 1024),
             Ok(SelfUpdateDecision::UpToDate)
         );
 
         let older = ReleaseMetadata {
             version: Version::new(1, 9, 0, 0),
             changelog: None,
+            download_source: Box::new(source("https://files.test/nexus.dll")),
         };
         assert_eq!(
-            plan_self_update(
-                current,
-                older,
-                vec![source("https://files.test/nexus.dll")],
-                replacement(),
-                1024
-            ),
+            plan_self_update(current, older, replacement(), 1024),
             Ok(SelfUpdateDecision::RemoteOlder)
         );
 
         let newer = ReleaseMetadata {
             version: Version::new(2, 1, 0, 0),
             changelog: Some("notes".to_owned()),
+            download_source: Box::new(source("https://files.test/nexus.dll")),
         };
         assert!(matches!(
-            plan_self_update(
-                current,
-                newer,
-                vec![source("https://files.test/nexus.dll")],
-                replacement(),
-                1024
-            ),
+            plan_self_update(current, newer, replacement(), 1024),
             Ok(SelfUpdateDecision::Available { .. })
         ));
     }

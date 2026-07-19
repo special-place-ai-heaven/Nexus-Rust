@@ -2,7 +2,7 @@
 //!
 //! The crate deliberately separates policy from I/O: applications inject a
 //! [`Transport`], [`Clock`], and [`FileSystem`], while the library enforces body
-//! limits, legacy cache lifetimes, and rollback-safe replacement ordering.
+//! limits, caller-selected cache policy, and rollback-safe replacement ordering.
 //!
 //! ```
 //! use nexus_network::Version;
@@ -31,17 +31,17 @@ pub use clock::{Clock, SystemClock};
 pub use filesystem::{FileSystem, FileSystemError, StdFileSystem};
 pub use http::{
     BaseUrl, BodyDecodeError, ClientError, DEFAULT_CACHE_MAX_AGE, DownloadError, DownloadReceipt,
-    GITHUB_API_CACHE_MAX_AGE, HttpClient, HttpClientConfig, HttpRequest, HttpResponse,
-    RAIDCORE_API_CACHE_MAX_AGE, RequestError, Transport, TransportError, TransportResponse,
-    legacy_cache_max_age, status_message,
+    HttpClient, HttpClientConfig, HttpRequest, HttpResponse, RequestError, Transport,
+    TransportError, TransportResponse, status_message,
 };
 pub use update::{
     AddonRelease, CommitError, CommitOutcome, CommitPlan, DigestParseError, DownloadAttemptError,
-    DownloadPlan, DownloadSource, GithubReleaseError, GithubRepositoryError, Md5Digest,
-    MetadataError, NEXUS_VERSION_ENDPOINT, PlanError, PlannedDownloader, ReleaseMetadata,
-    ReplacementError, ReplacementPlan, SelfUpdateDecision, StageError, StagedArtifact,
-    UpdateCheckError, Version, VersionParseError, apply_replacement, commit_download,
-    direct_addon_update_available, fetch_release_metadata, github_latest_release_endpoint,
-    github_releases_endpoint, legacy_direct_checksum_sources, legacy_self_update_sources,
-    plan_self_update, select_github_addon_update, select_latest_github_dll, stage_with_fallback,
+    DownloadPlan, DownloadSource, GITHUB_API_BASE_URL, GithubReleaseError, GithubRepositoryError,
+    Md5Digest, MetadataError, NEXUS_RUST_LATEST_RELEASE_ENDPOINT, PlanError, PlannedDownloader,
+    ReleaseMetadata, ReplacementError, ReplacementPlan, SelfUpdateDecision, StageError,
+    StagedArtifact, UpdateCheckError, Version, VersionParseError, apply_replacement,
+    commit_download, direct_addon_update_available, fetch_release_metadata,
+    github_latest_release_endpoint, github_releases_endpoint, legacy_direct_checksum_sources,
+    plan_self_update, select_github_addon_update, select_latest_github_dll, self_update_sources,
+    stage_with_fallback,
 };

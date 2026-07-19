@@ -4,7 +4,7 @@ description = "Owner-aware, MinHook-compatible inline hooks for the Nexus Rust r
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

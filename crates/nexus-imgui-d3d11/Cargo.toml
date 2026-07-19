@@ -4,8 +4,8 @@ description = "Dear ImGui 1.80 renderer with exhaustive D3D11 state restoration"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.97.1"
-license-file = "../../LICENSE"
-repository = "https://github.com/RaidcoreGG/Nexus"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 nexus-imgui-compat = { path = "../nexus-imgui-compat" }

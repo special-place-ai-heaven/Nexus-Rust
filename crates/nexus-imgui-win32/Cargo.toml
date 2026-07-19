@@ -4,7 +4,7 @@ description = "Explicit primary-window Win32 platform backend for Nexus Dear ImG
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! Dear ImGui 1.80 style persistence compatible with legacy Nexus settings and
+//! Dear ImGui 1.80 style persistence compatible with Nexus settings and
 //! `.imstyle180` preset files.
 
 use std::fs;
@@ -20,15 +20,11 @@ pub const IMGUI_STYLE_180_BYTES: usize = 1_044;
 
 const ARC_STYLE_PREFIX_BYTES: usize = 196;
 const ARC_COLOR_BYTES: usize = 848;
-const DEFAULT_LAYOUT_CODE: &str = include_str!("../tests/fixtures/default-layout.imstyle180");
-const NEXUS_CODE: &str = include_str!("../tests/fixtures/nexus.imstyle180");
-const ARC_STYLE_CODE: &str = include_str!("../tests/fixtures/arc-style-part.b64");
-const ARC_COLOR_CODE: &str = include_str!("../tests/fixtures/arc-colors-part.b64");
 
 const _: () = assert!(std::mem::size_of::<sys::ImGuiStyle>() == IMGUI_STYLE_180_BYTES);
 const _: () = assert!(ARC_STYLE_PREFIX_BYTES + ARC_COLOR_BYTES == IMGUI_STYLE_180_BYTES);
 
-/// Exact opaque bytes persisted by the C++ Nexus host.
+/// ABI-compatible opaque bytes persisted by Nexus settings and presets.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StyleBlob([u8; IMGUI_STYLE_180_BYTES]);
 
@@ -60,18 +56,83 @@ impl StyleBlob {
     }
 }
 
-/// Built-in styles shipped by the C++ host.
+fn generated_default_style() -> StyleBlob {
+    let mut storage = Box::new(std::mem::MaybeUninit::<sys::ImGuiStyle>::zeroed());
+    // SAFETY: every field in `ImGuiStyle` is a float, integer, boolean, or an
+    // array of those types, so the all-zero representation is valid. Starting
+    // from zero also gives deterministic padding bytes for persistence.
+    let style = unsafe { storage.assume_init_mut() };
+    style.Alpha = 1.0;
+    style.WindowPadding = sys::ImVec2 { x: 8.0, y: 8.0 };
+    style.WindowRounding = 0.0;
+    style.WindowBorderSize = 1.0;
+    style.WindowMinSize = sys::ImVec2 { x: 32.0, y: 32.0 };
+    style.WindowTitleAlign = sys::ImVec2 { x: 0.0, y: 0.5 };
+    style.WindowMenuButtonPosition = sys::ImGuiDir_Left;
+    style.ChildRounding = 0.0;
+    style.ChildBorderSize = 1.0;
+    style.PopupRounding = 0.0;
+    style.PopupBorderSize = 1.0;
+    style.FramePadding = sys::ImVec2 { x: 4.0, y: 3.0 };
+    style.FrameRounding = 0.0;
+    style.FrameBorderSize = 0.0;
+    style.ItemSpacing = sys::ImVec2 { x: 8.0, y: 4.0 };
+    style.ItemInnerSpacing = sys::ImVec2 { x: 4.0, y: 4.0 };
+    style.CellPadding = sys::ImVec2 { x: 4.0, y: 2.0 };
+    style.TouchExtraPadding = sys::ImVec2 { x: 0.0, y: 0.0 };
+    style.IndentSpacing = 21.0;
+    style.ColumnsMinSpacing = 6.0;
+    style.ScrollbarSize = 14.0;
+    style.ScrollbarRounding = 9.0;
+    style.GrabMinSize = 10.0;
+    style.GrabRounding = 0.0;
+    style.LogSliderDeadzone = 4.0;
+    style.TabRounding = 4.0;
+    style.TabBorderSize = 0.0;
+    style.TabMinWidthForCloseButton = 0.0;
+    style.ColorButtonPosition = sys::ImGuiDir_Right;
+    style.ButtonTextAlign = sys::ImVec2 { x: 0.5, y: 0.5 };
+    style.SelectableTextAlign = sys::ImVec2 { x: 0.0, y: 0.0 };
+    style.DisplayWindowPadding = sys::ImVec2 { x: 19.0, y: 19.0 };
+    style.DisplaySafeAreaPadding = sys::ImVec2 { x: 3.0, y: 3.0 };
+    style.MouseCursorScale = 1.0;
+    style.AntiAliasedLines = true;
+    style.AntiAliasedLinesUseTex = true;
+    style.AntiAliasedFill = true;
+    style.CurveTessellationTol = 1.25;
+    style.CircleSegmentMaxError = 1.60;
+    // SAFETY: `style` is a live, uniquely borrowed destination. Dear ImGui's
+    // palette helper does not require a current context when one is provided.
+    unsafe { sys::igStyleColorsDark(style) };
+
+    let mut bytes = [0_u8; IMGUI_STYLE_180_BYTES];
+    // SAFETY: the compile-time size assertion above proves both buffers have
+    // the same length. `style` is fully initialized and remains live here.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(style).cast::<u8>(),
+            bytes.as_mut_ptr(),
+            IMGUI_STYLE_180_BYTES,
+        );
+    }
+    StyleBlob(bytes)
+}
+
+/// Stable compatibility names for built-in host styles.
+///
+/// All three currently resolve to a freshly generated Dear ImGui 1.80 dark
+/// default. The original preset blobs are intentionally not redistributed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedStyle {
-    /// Legacy default field layout used before applying ImGui palettes.
+    /// Fresh Dear ImGui 1.80 default layout and dark colors.
     DefaultLayout,
-    /// Nexus dark preset.
+    /// Nexus-compatible dark fallback.
     Nexus,
-    /// ArcDPS default style and color pair.
+    /// ArcDPS-compatible dark fallback.
     ArcDpsDefault,
 }
 
-/// Dear ImGui color palette applied after the legacy default layout.
+/// Dear ImGui color palette applied after a fresh default layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Palette {
     /// `StyleColorsClassic`.
@@ -259,25 +320,22 @@ impl<B: StyleBackend> StyleService<B> {
         Ok(())
     }
 
-    /// Applies one of the embedded legacy presets.
+    /// Applies a self-contained style selected by a stable compatibility name.
     pub fn apply_embedded(&mut self, style: EmbeddedStyle) -> Result<(), StyleError> {
-        let blob = match style {
-            EmbeddedStyle::DefaultLayout => StyleBlob::decode(DEFAULT_LAYOUT_CODE)?,
-            EmbeddedStyle::Nexus => StyleBlob::decode(NEXUS_CODE)?,
-            EmbeddedStyle::ArcDpsDefault => decode_arc_parts(ARC_STYLE_CODE, ARC_COLOR_CODE)?,
-        };
+        let _compatibility_name = style;
+        let blob = generated_default_style();
         self.backend.apply(&blob)?;
         Ok(())
     }
 
-    /// Applies the legacy default layout followed by an ImGui color palette.
+    /// Applies a fresh default layout followed by an ImGui color palette.
     pub fn apply_palette(&mut self, palette: Palette) -> Result<(), StyleError> {
         self.apply_embedded(EmbeddedStyle::DefaultLayout)?;
         self.backend.apply_palette(palette)?;
         Ok(())
     }
 
-    /// Applies the user setting, falling back to the Nexus preset when missing.
+    /// Applies the user setting, falling back to the generated dark style.
     pub fn apply_user(&mut self, settings: &mut impl StyleSettings) -> Result<(), StyleError> {
         match settings.get_string(IMGUI_STYLE_SETTING)? {
             Some(code) if !code.is_empty() => self.apply_code(&code),
@@ -360,9 +418,13 @@ fn trim_line_ending(value: &str) -> &str {
 mod tests {
     use std::collections::BTreeMap;
 
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
     use super::{
-        EmbeddedStyle, IMGUI_STYLE_180_BYTES, IMGUI_STYLE_SETTING, Palette, StyleBackend,
-        StyleBackendError, StyleBlob, StyleIoError, StyleService, StyleSettings, StyleStorage,
+        ARC_STYLE_PREFIX_BYTES, EmbeddedStyle, IMGUI_STYLE_180_BYTES, IMGUI_STYLE_SETTING, Palette,
+        StyleBackend, StyleBackendError, StyleBlob, StyleIoError, StyleService, StyleSettings,
+        StyleStorage, decode_arc_parts, generated_default_style,
     };
 
     #[derive(Clone)]
@@ -430,12 +492,15 @@ mod tests {
     }
 
     #[test]
-    fn golden_legacy_nexus_style_round_trips_byte_for_byte() {
-        let golden = include_str!("../tests/fixtures/nexus.imstyle180").trim();
-        let blob = StyleBlob::decode(golden)
-            .unwrap_or_else(|error| panic!("golden style failed: {error}"));
+    fn generated_default_style_round_trips_with_stable_abi_shape() {
+        let blob = generated_default_style();
+        let code = blob.encode();
+        let decoded = StyleBlob::decode(&format!("{code}\r\n"))
+            .unwrap_or_else(|error| panic!("generated style failed: {error}"));
         assert_eq!(blob.as_bytes().len(), IMGUI_STYLE_180_BYTES);
-        assert_eq!(blob.encode(), golden);
+        assert!(blob.as_bytes().iter().any(|byte| *byte != 0));
+        assert_eq!(decoded, blob);
+        assert_eq!(decoded.encode(), code);
     }
 
     #[test]
@@ -459,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_user_style_falls_back_to_embedded_nexus() {
+    fn missing_user_style_falls_back_to_generated_dark() {
         let mut service = StyleService::new(Backend::default());
         assert!(service.apply_user(&mut MemoryIo::default()).is_ok());
         assert_eq!(service.into_backend().applications, 1);
@@ -475,13 +540,29 @@ mod tests {
     }
 
     #[test]
-    fn arc_default_parts_reconstruct_a_complete_style() {
-        let mut service = StyleService::new(Backend::default());
-        assert!(service.apply_embedded(EmbeddedStyle::ArcDpsDefault).is_ok());
-        assert_eq!(
-            service.into_backend().current.as_bytes().len(),
-            IMGUI_STYLE_180_BYTES
-        );
+    fn compatibility_names_use_the_generated_fallback() {
+        let expected = generated_default_style();
+        for name in [
+            EmbeddedStyle::DefaultLayout,
+            EmbeddedStyle::Nexus,
+            EmbeddedStyle::ArcDpsDefault,
+        ] {
+            let mut service = StyleService::new(Backend::default());
+            assert!(service.apply_embedded(name).is_ok());
+            let backend = service.into_backend();
+            assert_eq!(backend.current, expected);
+            assert_eq!(backend.applications, 1);
+        }
+    }
+
+    #[test]
+    fn arc_style_parts_reconstruct_an_arbitrary_complete_style() {
+        let expected = generated_default_style();
+        let style = STANDARD.encode(&expected.as_bytes()[..ARC_STYLE_PREFIX_BYTES]);
+        let colors = STANDARD.encode(&expected.as_bytes()[ARC_STYLE_PREFIX_BYTES..]);
+        let decoded = decode_arc_parts(&style, &colors)
+            .unwrap_or_else(|error| panic!("Arc style reconstruction failed: {error}"));
+        assert_eq!(decoded, expected);
     }
 
     #[test]

@@ -18,8 +18,8 @@ pub enum PathKey {
     CommonDirectory,
     /// The Guild Wars 2 API cache directory.
     GuildWars2ApiCacheDirectory,
-    /// The Raidcore API cache directory.
-    RaidcoreApiCacheDirectory,
+    /// The host-neutral Nexus-Rust HTTP cache directory.
+    HttpCacheDirectory,
     /// The GitHub API cache directory.
     GitHubApiCacheDirectory,
     /// `<game>/addons/Nexus`.
@@ -66,8 +66,8 @@ pub enum PathKey {
     AddonConfigDefault,
     /// The arcdps integration DLL.
     ArcdpsIntegration,
-    /// The bundled third-party software notice.
-    ThirdPartySoftwareReadme,
+    /// The bundled third-party notices file.
+    ThirdPartyNotices,
     /// The English locale file.
     LocaleEnglish,
     /// The German locale file.
@@ -102,7 +102,7 @@ impl PathKey {
         Self::AddonsDirectory,
         Self::CommonDirectory,
         Self::GuildWars2ApiCacheDirectory,
-        Self::RaidcoreApiCacheDirectory,
+        Self::HttpCacheDirectory,
         Self::GitHubApiCacheDirectory,
         Self::NexusDirectory,
         Self::TempDirectory,
@@ -126,7 +126,7 @@ impl PathKey {
         Self::Settings,
         Self::AddonConfigDefault,
         Self::ArcdpsIntegration,
-        Self::ThirdPartySoftwareReadme,
+        Self::ThirdPartyNotices,
         Self::LocaleEnglish,
         Self::LocaleGerman,
         Self::LocaleFrench,
@@ -202,8 +202,8 @@ impl PathIndex {
         );
         set(
             &mut paths,
-            PathKey::RaidcoreApiCacheDirectory,
-            common.join("api.raidcore.gg"),
+            PathKey::HttpCacheDirectory,
+            common.join("Nexus-Rust").join("Cache"),
         );
         set(
             &mut paths,
@@ -268,10 +268,7 @@ impl PathIndex {
             (PathKey::Settings, "Settings.json"),
             (PathKey::AddonConfigDefault, "AddonConfig.json"),
             (PathKey::ArcdpsIntegration, "arcdps_integration64.dll"),
-            (
-                PathKey::ThirdPartySoftwareReadme,
-                "THIRDPARTYSOFTWAREREADME.TXT",
-            ),
+            (PathKey::ThirdPartyNotices, "THIRD_PARTY_NOTICES.md"),
         ] {
             set(&mut paths, key, nexus.join(filename));
         }
@@ -327,6 +324,7 @@ impl PathIndex {
         for key in [
             PathKey::AddonsDirectory,
             PathKey::CommonDirectory,
+            PathKey::HttpCacheDirectory,
             PathKey::NexusDirectory,
             PathKey::TempDirectory,
             PathKey::FontsDirectory,
@@ -396,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn prepares_exact_legacy_names_without_mutation() {
+    fn prepares_compatibility_paths_without_mutation() {
         let temp = TempRoot::new();
         let game = temp.0.join("Igra_日本");
         let module = game.join("d3d11.dll");
@@ -411,8 +409,12 @@ mod tests {
             game.join("addons/Nexus/Settings.json")
         );
         assert_eq!(
-            index.get(PathKey::ThirdPartySoftwareReadme),
-            game.join("addons/Nexus/THIRDPARTYSOFTWAREREADME.TXT")
+            index.get(PathKey::ThirdPartyNotices),
+            game.join("addons/Nexus/THIRD_PARTY_NOTICES.md")
+        );
+        assert_eq!(
+            index.get(PathKey::HttpCacheDirectory),
+            game.join("addons/common/Nexus-Rust/Cache")
         );
         assert_eq!(
             index.get(PathKey::NexusDllUpdate),
@@ -423,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_only_the_legacy_directory_tree_under_injected_root() {
+    fn creates_only_the_required_directory_tree_under_injected_root() {
         let temp = TempRoot::new();
         let game = temp.0.join("game");
         let index = PathIndex::prepare(PathRoots::new(
@@ -440,6 +442,7 @@ mod tests {
         for key in [
             PathKey::AddonsDirectory,
             PathKey::CommonDirectory,
+            PathKey::HttpCacheDirectory,
             PathKey::NexusDirectory,
             PathKey::TempDirectory,
             PathKey::FontsDirectory,

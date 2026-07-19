@@ -1,5 +1,5 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
-//! Exact legacy Nexus host fonts with an owned, render-thread rebuild boundary.
+//! Legacy-compatible host font identifiers with an owned rebuild boundary.
 //!
 //! [`FontRebuildRequest`] is safe to prepare on any thread. It owns optional
 //! user-font bytes and exposes borrowed [`CatalogRegistration`] values only for
@@ -7,6 +7,12 @@
 //! configuration it accepts. Actual atlas work happens solely through
 //! [`FontRebuildRequest::apply_pre_new_frame`], which preserves the existing
 //! thread-bound manager and pre-`NewFrame` backend contract.
+//!
+//! The built-in catalog intentionally uses Dear ImGui's compiled-in default
+//! font for every legacy role. This keeps the host self-contained and avoids
+//! redistributing third-party font files. Identifiers, sizes, selection, and
+//! user-font merge behavior remain compatible; only the fallback typeface is
+//! intentionally different.
 //!
 //! ```
 //! use nexus_ui_fonts::{DEFAULT_FONT_SIZE, FontRebuildRequest};
@@ -20,7 +26,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::sync::Arc;
 
-use nexus_ui_imgui::ImGuiFontAtlasBackend;
+use nexus_ui_imgui::{IMGUI_DEFAULT_FONT_DATA, ImGuiFontAtlasBackend};
 use nexus_ui_services::{
     FontAdvance, FontAtlasBackend, FontConfig, FontError, FontHandle, FontManager,
     FontMemoryReplacement, FontOwnerReplaceError, FontOwnerReplaceReport, OwnerId, UiScale,
@@ -83,21 +89,16 @@ const MENOMONIA_XL_MERGE: &str = "MENOMONIA_XL_MERGE";
 const MENOMONIA_BIG_XL_MERGE: &str = "MENOMONIA_BIG_XL_MERGE";
 const FIRASANS_XL_MERGE: &str = "FIRASANS_XL_MERGE";
 
-const INTER_BYTES: &[u8] = include_bytes!("../../../res/Fonts/Inter.ttf");
-const MENOMONIA_BYTES: &[u8] = include_bytes!("../../../res/Fonts/Menomonia.ttf");
-const FIRASANS_BYTES: &[u8] = include_bytes!("../../../res/Fonts/FiraSans.ttf");
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmbeddedSource {
+enum BuiltInRole {
     Menomonia,
     FiraSans,
 }
 
-impl EmbeddedSource {
+impl BuiltInRole {
     const fn bytes(self) -> &'static [u8] {
         match self {
-            Self::Menomonia => MENOMONIA_BYTES,
-            Self::FiraSans => FIRASANS_BYTES,
+            Self::Menomonia | Self::FiraSans => IMGUI_DEFAULT_FONT_DATA,
         }
     }
 
@@ -114,7 +115,7 @@ struct FontSpec {
     identifier: &'static str,
     merge_identifier: &'static str,
     size: f32,
-    source: EmbeddedSource,
+    source: BuiltInRole,
 }
 
 const HOST_FONT_SPECS: [FontSpec; 12] = [
@@ -122,84 +123,84 @@ const HOST_FONT_SPECS: [FontSpec; 12] = [
         identifier: MENOMONIA_S,
         merge_identifier: MENOMONIA_S_MERGE,
         size: 16.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: MENOMONIA_BIG_S,
         merge_identifier: MENOMONIA_BIG_S_MERGE,
         size: 22.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: FIRASANS_S,
         merge_identifier: FIRASANS_S_MERGE,
         size: 15.0,
-        source: EmbeddedSource::FiraSans,
+        source: BuiltInRole::FiraSans,
     },
     FontSpec {
         identifier: MENOMONIA_N,
         merge_identifier: MENOMONIA_N_MERGE,
         size: 18.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: MENOMONIA_BIG_N,
         merge_identifier: MENOMONIA_BIG_N_MERGE,
         size: 24.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: FIRASANS_N,
         merge_identifier: FIRASANS_N_MERGE,
         size: 16.0,
-        source: EmbeddedSource::FiraSans,
+        source: BuiltInRole::FiraSans,
     },
     FontSpec {
         identifier: MENOMONIA_L,
         merge_identifier: MENOMONIA_L_MERGE,
         size: 20.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: MENOMONIA_BIG_L,
         merge_identifier: MENOMONIA_BIG_L_MERGE,
         size: 26.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: FIRASANS_L,
         merge_identifier: FIRASANS_L_MERGE,
         size: 17.5,
-        source: EmbeddedSource::FiraSans,
+        source: BuiltInRole::FiraSans,
     },
     FontSpec {
         identifier: MENOMONIA_XL,
         merge_identifier: MENOMONIA_XL_MERGE,
         size: 22.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: MENOMONIA_BIG_XL,
         merge_identifier: MENOMONIA_BIG_XL_MERGE,
         size: 28.0,
-        source: EmbeddedSource::Menomonia,
+        source: BuiltInRole::Menomonia,
     },
     FontSpec {
         identifier: FIRASANS_XL,
         merge_identifier: FIRASANS_XL_MERGE,
         size: 19.5,
-        source: EmbeddedSource::FiraSans,
+        source: BuiltInRole::FiraSans,
     },
 ];
 
 /// Source selected for one catalog registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FontSource {
-    /// Embedded Inter fallback used by the host default.
+    /// Built-in fallback occupying the legacy Inter/default role.
     Inter,
-    /// Embedded Menomonia display font.
+    /// Built-in fallback occupying a legacy Menomonia display role.
     Menomonia,
-    /// Embedded Fira Sans UI font.
+    /// Built-in fallback occupying a legacy Fira Sans UI role.
     FiraSans,
     /// Owned user-font bytes, either as the default or a merge input.
     User,
@@ -279,9 +280,9 @@ pub struct CatalogRegistration<'request> {
     pub identifier: &'static str,
     /// Legacy rasterized size in pixels.
     pub size: f32,
-    /// Embedded or user source classification.
+    /// Built-in role or user source classification.
     pub source: FontSource,
-    /// Font bytes kept alive by the request or the executable image.
+    /// User bytes or the backend's self-contained default-font marker.
     pub data: &'request [u8],
     /// Deep-owned Dear ImGui configuration for this input.
     pub config: FontConfig,
@@ -330,7 +331,7 @@ impl FontRebuildRequest {
     }
 
     /// Returns whether the user font replaces the default and merges into the
-    /// twelve scale-specific embedded inputs.
+    /// twelve scale-specific built-in inputs.
     #[must_use]
     pub const fn has_user_font(&self) -> bool {
         self.user_font.is_some()
@@ -353,7 +354,7 @@ impl FontRebuildRequest {
         let (default_data, default_source) = self
             .user_font
             .as_ref()
-            .map_or((INTER_BYTES, FontSource::Inter), |font| {
+            .map_or((IMGUI_DEFAULT_FONT_DATA, FontSource::Inter), |font| {
                 (font.as_bytes(), FontSource::User)
             });
         registrations.push(CatalogRegistration {
@@ -614,11 +615,11 @@ mod tests {
     use super::{
         BASE_CATALOG_FONT_COUNT, DEFAULT_FONT_SIZE, FIRASANS_L, FIRASANS_L_MERGE, FIRASANS_N,
         FIRASANS_N_MERGE, FIRASANS_S, FIRASANS_S_MERGE, FIRASANS_XL, FIRASANS_XL_MERGE,
-        FONT_DEFAULT, FontCatalogError, FontRebuildRequest, FontSource, MAX_DEFAULT_FONT_SIZE,
-        MAX_USER_FONT_BYTES, MENOMONIA_BIG_L, MENOMONIA_BIG_L_MERGE, MENOMONIA_BIG_N,
-        MENOMONIA_BIG_N_MERGE, MENOMONIA_BIG_S, MENOMONIA_BIG_S_MERGE, MENOMONIA_BIG_XL,
-        MENOMONIA_BIG_XL_MERGE, MENOMONIA_L, MENOMONIA_L_MERGE, MENOMONIA_N, MENOMONIA_N_MERGE,
-        MENOMONIA_S, MENOMONIA_S_MERGE, MENOMONIA_XL, MENOMONIA_XL_MERGE,
+        FONT_DEFAULT, FontCatalogError, FontRebuildRequest, FontSource, IMGUI_DEFAULT_FONT_DATA,
+        MAX_DEFAULT_FONT_SIZE, MAX_USER_FONT_BYTES, MENOMONIA_BIG_L, MENOMONIA_BIG_L_MERGE,
+        MENOMONIA_BIG_N, MENOMONIA_BIG_N_MERGE, MENOMONIA_BIG_S, MENOMONIA_BIG_S_MERGE,
+        MENOMONIA_BIG_XL, MENOMONIA_BIG_XL_MERGE, MENOMONIA_L, MENOMONIA_L_MERGE, MENOMONIA_N,
+        MENOMONIA_N_MERGE, MENOMONIA_S, MENOMONIA_S_MERGE, MENOMONIA_XL, MENOMONIA_XL_MERGE,
         MERGED_CATALOG_FONT_COUNT, MIN_DEFAULT_FONT_SIZE, UserFont, UserFontError,
         selected_font_identifiers, validate_user_font_len,
     };
@@ -690,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_catalog_has_exact_legacy_order_sizes_and_sources() {
+    fn built_in_catalog_preserves_legacy_order_sizes_and_roles() {
         let request = FontRebuildRequest::default();
         let registrations = request.registrations();
         assert_eq!(registrations.len(), BASE_CATALOG_FONT_COUNT);
@@ -723,7 +724,11 @@ mod tests {
                 (FIRASANS_XL, 19.5, FontSource::FiraSans, false),
             ]
         );
-        assert!(registrations.iter().all(|font| !font.data.is_empty()));
+        assert!(
+            registrations
+                .iter()
+                .all(|font| font.data == IMGUI_DEFAULT_FONT_DATA)
+        );
     }
 
     #[test]

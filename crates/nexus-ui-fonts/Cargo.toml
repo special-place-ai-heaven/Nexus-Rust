@@ -1,10 +1,10 @@
 [package]
 name = "nexus-ui-fonts"
-description = "Legacy-compatible embedded font catalog and render-thread rebuild planning for Nexus"
+description = "Legacy-compatible font catalog and render-thread rebuild planning for Nexus"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

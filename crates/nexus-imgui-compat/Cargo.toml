@@ -4,7 +4,7 @@ description = "Exact Dear ImGui 1.80 compatibility boundary for native Nexus add
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

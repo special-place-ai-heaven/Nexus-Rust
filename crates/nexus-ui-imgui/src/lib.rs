@@ -14,6 +14,13 @@ const MAX_STATIC_RANGE_UNITS: usize = 131_072;
 const LATIN_EXTENDED_START: u16 = 0x0100;
 const LATIN_EXTENDED_END: u16 = 0x024F;
 
+/// Opaque, non-font marker that requests Dear ImGui's built-in default font.
+///
+/// This keeps host-owned catalog entries self-contained without pretending the
+/// marker is a TTF payload. [`ImGuiFontAtlasBackend`] recognizes it before any
+/// memory-font call; other backends may reject it as ordinary invalid data.
+pub const IMGUI_DEFAULT_FONT_DATA: &[u8] = b"\0nexus-rust/imgui-default-font\0";
+
 /// Thread-bound Dear ImGui font-atlas builder.
 ///
 /// The caller must make the target ImGui context current and invoke this only
@@ -75,20 +82,27 @@ impl FontAtlasBackend for ImGuiFontAtlasBackend {
                 recover_default_atlas(atlas);
                 return Err(FontBackendError::RejectedInput);
             };
-            let config_ref = config.as_mut();
-            config_ref.FontDataOwnedByAtlas = false;
-            config_ref.GlyphRanges = ranges.as_ptr();
-            // SAFETY: the checked byte count fits c_int, data remains live
-            // through Build, config is initialized, and ranges are terminated.
-            let pointer = unsafe {
-                sys::ImFontAtlas_AddFontFromMemoryTTF(
-                    atlas,
-                    font.data.as_ptr().cast_mut().cast::<c_void>(),
-                    length,
-                    font.size,
-                    config.as_ptr(),
-                    ranges.as_ptr(),
-                )
+            config.as_mut().GlyphRanges = ranges.as_ptr();
+            let pointer = if font.data == IMGUI_DEFAULT_FONT_DATA {
+                config.as_mut().SizePixels = font.size;
+                // SAFETY: the live atlas is unlocked, the configuration and
+                // terminated ranges outlive this call, and Dear ImGui owns the
+                // decompressed bytes for its compiled-in default font.
+                unsafe { sys::ImFontAtlas_AddFontDefault(atlas, config.as_ptr()) }
+            } else {
+                config.as_mut().FontDataOwnedByAtlas = false;
+                // SAFETY: the checked byte count fits c_int, data remains live
+                // through Build, config is initialized, and ranges terminate.
+                unsafe {
+                    sys::ImFontAtlas_AddFontFromMemoryTTF(
+                        atlas,
+                        font.data.as_ptr().cast_mut().cast::<c_void>(),
+                        length,
+                        font.size,
+                        config.as_ptr(),
+                        ranges.as_ptr(),
+                    )
+                }
             };
             // SAFETY: a non-null return is owned by this live atlas until the
             // manager's mandatory invalidation notification before rebuilding.
@@ -261,7 +275,7 @@ mod tests {
     use nexus_imgui_runtime::ImGuiContextOwner;
     use nexus_ui_services::{FontAtlasBackend, FontBuildRequest, FontConfig, GlyphCoverage};
 
-    use super::{ImGuiFontAtlasBackend, collapse_ranges};
+    use super::{IMGUI_DEFAULT_FONT_DATA, ImGuiFontAtlasBackend, collapse_ranges};
 
     static CONTEXT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -283,14 +297,14 @@ mod tests {
     }
 
     #[test]
-    fn real_imgui_180_context_builds_an_owned_memory_font() {
+    fn real_imgui_180_context_builds_the_self_contained_default_font() {
         let _lock = context_lock();
         let mut owner = ImGuiContextOwner::create().expect("test context should be available");
         let identifier = CString::new("FONT_DEFAULT").expect("static identifier is valid");
         let localized = CString::new("Zażółć gęślą jaźń").expect("fixture text is valid");
         let request = FontBuildRequest {
             identifier: &identifier,
-            data: include_bytes!("../../../res/Fonts/FiraSans.ttf"),
+            data: IMGUI_DEFAULT_FONT_DATA,
             size: 16.0,
             config: &FontConfig::default(),
             coverage: GlyphCoverage::HostDefault,
@@ -299,7 +313,7 @@ mod tests {
         let handles = owner.with_current(|| {
             backend
                 .rebuild(&[request], &[localized.as_c_str()])
-                .expect("valid embedded font should build")
+                .expect("Dear ImGui default font should build")
         });
         assert_eq!(handles.len(), 1);
         assert!(handles[0].is_some());

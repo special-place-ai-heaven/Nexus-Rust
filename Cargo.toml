@@ -44,8 +44,8 @@ resolver = "3"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.97.1"
-license-file = "LICENSE"
-repository = "https://github.com/RaidcoreGG/Nexus"
+license = "Apache-2.0"
+repository = "https://github.com/special-place-ai-heaven/Nexus-Rust"
 
 [workspace.dependencies]
 imgui-sys = "=0.7.0"

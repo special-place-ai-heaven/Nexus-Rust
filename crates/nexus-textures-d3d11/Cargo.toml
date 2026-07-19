@@ -4,7 +4,7 @@ description = "Owned D3D11 RGBA8 texture backend for Nexus"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

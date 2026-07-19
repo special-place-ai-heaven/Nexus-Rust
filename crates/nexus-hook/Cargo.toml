@@ -4,7 +4,7 @@ description = "Per-instance COM vtable shadowing for the Nexus Rust runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [lints]
