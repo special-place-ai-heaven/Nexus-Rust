@@ -26,7 +26,7 @@ pub use game::{
 pub use game_ids::{GameBindId, KnownGameBind, known_game_binds};
 pub use managed::{
     CallbackExecutor, CallbackKind, CallbackLimits, InlineExecutor, InvokeOutcome, LoadReport,
-    ManagedBindSnapshot, ManagedInputBinds, OwnerGeneration, RegisterOutcome, RouteOutcome,
-    SetBindError,
+    ManagedBindSnapshot, ManagedInputBinds, ManagedRegistrationToken, OwnerGeneration,
+    RegisterOutcome, RouteOutcome, SetBindError,
 };
 pub use raw::{RawCallbackToken, RawMessage, RawRoute, RawRouteReport, RawWndProcRegistry};

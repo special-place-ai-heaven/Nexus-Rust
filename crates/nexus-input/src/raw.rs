@@ -3,6 +3,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use nexus_core::CallbackId;
+
 use crate::{CallbackLimits, OwnerGeneration};
 
 /// Raw platform message. Handle-like values stay opaque integers.
@@ -29,12 +31,12 @@ pub enum RawRoute {
 
 /// Opaque registration token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RawCallbackToken(u64);
+pub struct RawCallbackToken(u128);
 
 impl RawCallbackToken {
     /// Exposes the stable non-address token for diagnostics.
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub const fn get(self) -> u128 {
         self.0
     }
 }
@@ -56,6 +58,7 @@ type RawCallback = dyn Fn(RawMessage) -> RawRoute + Send + Sync + 'static;
 
 struct Entry {
     owner: OwnerGeneration,
+    callback_id: Option<CallbackId>,
     callback: Arc<RawCallback>,
     panics: AtomicU32,
     disabled: AtomicBool,
@@ -78,7 +81,7 @@ impl Entry {
 
 #[derive(Default)]
 struct RegistryState {
-    next_token: u64,
+    next_token: u128,
     entries: BTreeMap<RawCallbackToken, Arc<Entry>>,
 }
 
@@ -116,8 +119,34 @@ impl RawWndProcRegistry {
     where
         F: Fn(RawMessage) -> RawRoute + Send + Sync + 'static,
     {
+        self.register_inner(owner, None, callback)
+    }
+
+    /// Appends a callback with its authenticated foreign function identity.
+    pub fn register_identified<F>(
+        &self,
+        owner: OwnerGeneration,
+        callback_id: CallbackId,
+        callback: F,
+    ) -> RawCallbackToken
+    where
+        F: Fn(RawMessage) -> RawRoute + Send + Sync + 'static,
+    {
+        self.register_inner(owner, Some(callback_id), callback)
+    }
+
+    fn register_inner<F>(
+        &self,
+        owner: OwnerGeneration,
+        callback_id: Option<CallbackId>,
+        callback: F,
+    ) -> RawCallbackToken
+    where
+        F: Fn(RawMessage) -> RawRoute + Send + Sync + 'static,
+    {
         let entry = Arc::new(Entry {
             owner,
+            callback_id,
             callback: Arc::new(callback),
             panics: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
@@ -125,7 +154,10 @@ impl RawWndProcRegistry {
         });
         let (token, replaced) = {
             let mut state = self.lock_state();
-            state.next_token = state.next_token.saturating_add(1).max(1);
+            state.next_token = state
+                .next_token
+                .checked_add(1)
+                .expect("raw callback token space exhausted");
             let token = RawCallbackToken(state.next_token);
             let replaced = state.entries.insert(token, entry);
             (token, replaced)
@@ -143,6 +175,29 @@ impl RawWndProcRegistry {
         let was_registered = removed.is_some();
         drop(removed);
         was_registered
+    }
+
+    /// Removes callbacks matching one exact owner generation and function identity.
+    pub fn deregister_callback(&self, owner: OwnerGeneration, callback_id: CallbackId) -> usize {
+        let mut removed = Vec::new();
+        {
+            let mut state = self.lock_state();
+            let tokens: Vec<RawCallbackToken> = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.owner == owner && entry.callback_id == Some(callback_id))
+                .map(|(token, _)| *token)
+                .collect();
+            removed.reserve(tokens.len());
+            for token in tokens {
+                if let Some(entry) = state.entries.remove(&token) {
+                    removed.push(entry);
+                }
+            }
+        }
+        let removed_count = removed.len();
+        drop(removed);
+        removed_count
     }
 
     /// Removes callbacks from exactly one addon load generation.
@@ -226,7 +281,7 @@ impl RawWndProcRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::*;
 
@@ -309,16 +364,56 @@ mod tests {
     #[test]
     fn callback_can_deregister_itself_without_deadlock() {
         let registry = Arc::new(RawWndProcRegistry::default());
-        let token_value = Arc::new(AtomicU64::new(0));
+        let token_value = Arc::new(Mutex::new(None));
         let callback_registry = Arc::clone(&registry);
         let callback_token = Arc::clone(&token_value);
         let token = registry.register(OwnerGeneration::new(1, 1), move |_| {
-            callback_registry.deregister(RawCallbackToken(callback_token.load(Ordering::Acquire)));
+            let token = callback_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("callback token should be published before routing");
+            callback_registry.deregister(token);
             RawRoute::Continue
         });
-        token_value.store(token.get(), Ordering::Release);
+        *token_value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
         let _ = registry.route(message());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn callback_identity_deregistration_is_owner_generation_scoped() {
+        let registry = RawWndProcRegistry::default();
+        let owner = OwnerGeneration::new(1, 1);
+        let foreign = OwnerGeneration::new(2, 1);
+        let callback = CallbackId::new(1).expect("test callback identity is nonzero");
+        let other_callback = CallbackId::new(2).expect("test callback identity is nonzero");
+
+        registry.register_identified(owner, callback, |_| RawRoute::Continue);
+        registry.register_identified(foreign, callback, |_| RawRoute::Continue);
+        registry.register_identified(owner, other_callback, |_| RawRoute::Continue);
+        registry.register(owner, |_| RawRoute::Continue);
+
+        assert_eq!(registry.deregister_callback(owner, callback), 1);
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.deregister_callback(owner, callback), 0);
+        assert_eq!(registry.deregister_callback(foreign, callback), 1);
+        assert_eq!(registry.deregister_callback(owner, other_callback), 1);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn stale_registration_token_cannot_remove_a_later_callback() {
+        let registry = RawWndProcRegistry::default();
+        let stale = registry.register(OwnerGeneration::new(1, 1), |_| RawRoute::Continue);
+        assert!(registry.deregister(stale));
+
+        let current = registry.register(OwnerGeneration::new(1, 1), |_| RawRoute::Continue);
+        assert_ne!(stale, current);
+        assert!(!registry.deregister(stale));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.deregister(current));
     }
 
     #[test]
@@ -343,10 +438,14 @@ mod tests {
         assert!(cleaned.load(Ordering::Acquire));
 
         let registry = Arc::new(RawWndProcRegistry::default());
-        registry.lock_state().next_token = u64::MAX - 1;
+        registry.lock_state().next_token = u128::from(u64::MAX) - 1;
         let replaced = Arc::new(AtomicBool::new(false));
-        register_drop_probe(&registry, OwnerGeneration::new(3, 1), Arc::clone(&replaced));
-        registry.register(OwnerGeneration::new(3, 2), |_| RawRoute::Continue);
+        let first =
+            register_drop_probe(&registry, OwnerGeneration::new(3, 1), Arc::clone(&replaced));
+        let second = registry.register(OwnerGeneration::new(3, 2), |_| RawRoute::Continue);
+        assert_ne!(first, second);
+        assert!(!replaced.load(Ordering::Acquire));
+        assert!(registry.deregister(first));
         assert!(replaced.load(Ordering::Acquire));
     }
 

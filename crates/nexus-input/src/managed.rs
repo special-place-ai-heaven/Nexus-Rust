@@ -93,7 +93,36 @@ pub enum RegisterOutcome {
     ConflictCleared,
 }
 
-/// Conflict raised while explicitly changing a managed binding.
+/// Opaque receipt for one exact managed callback publication.
+///
+/// A receipt remains specific to the callback instance it was issued for, even
+/// when the same owner replaces that identifier later.
+#[derive(Clone)]
+pub struct ManagedRegistrationToken {
+    marker: Arc<()>,
+}
+
+impl std::fmt::Debug for ManagedRegistrationToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRegistrationToken")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedRegistrationToken {
+    fn new() -> Self {
+        Self {
+            marker: Arc::new(()),
+        }
+    }
+
+    fn matches(&self, registration: &RegisteredCallback) -> bool {
+        Arc::ptr_eq(&self.marker, &registration.marker)
+    }
+}
+
+/// Error raised while registering or explicitly changing a managed binding.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SetBindError {
     /// The identifier violates defensive length constraints.
@@ -105,6 +134,9 @@ pub enum SetBindError {
         /// Existing identifier. This is data, not part of the closed error display.
         identifier: String,
     },
+    /// Another owner generation already has a handler under this identifier.
+    #[error("input binding handler belongs to another owner generation")]
+    ForeignHandler,
 }
 
 /// Callback invocation result.
@@ -221,14 +253,21 @@ struct RegisteredCallback {
     owner: OwnerGeneration,
     callback: Callback,
     gate: Arc<PanicGate>,
+    marker: Arc<()>,
 }
 
 impl RegisteredCallback {
-    fn new(owner: OwnerGeneration, callback: Callback, limits: CallbackLimits) -> Self {
+    fn new(
+        owner: OwnerGeneration,
+        callback: Callback,
+        limits: CallbackLimits,
+        marker: Arc<()>,
+    ) -> Self {
         Self {
             owner,
             callback,
             gate: Arc::new(PanicGate::new(limits.max_panics)),
+            marker,
         }
     }
 }
@@ -302,6 +341,22 @@ impl ManagedInputBinds {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
+        self.register_v1_string_tracked(identifier, owner, callback, default_binding, resolver)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Registers a legacy/v1 callback and returns an exact publication receipt.
+    pub fn register_v1_string_tracked<F>(
+        &self,
+        identifier: &str,
+        owner: OwnerGeneration,
+        callback: F,
+        default_binding: &str,
+        resolver: &dyn KeyNameResolver,
+    ) -> Result<(RegisterOutcome, ManagedRegistrationToken), SetBindError>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
         self.register(
             identifier,
             owner,
@@ -321,6 +376,21 @@ impl ManagedInputBinds {
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
+        self.register_v1_tracked(identifier, owner, callback, default_binding)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Registers a structured legacy/v1 callback and returns an exact receipt.
+    pub fn register_v1_tracked<F>(
+        &self,
+        identifier: &str,
+        owner: OwnerGeneration,
+        callback: F,
+        default_binding: LegacyInputBind,
+    ) -> Result<(RegisterOutcome, ManagedRegistrationToken), SetBindError>
+    where
+        F: Fn(&str) + Send + Sync + 'static,
+    {
         self.register(
             identifier,
             owner,
@@ -337,6 +407,22 @@ impl ManagedInputBinds {
         callback: F,
         default_binding: B,
     ) -> Result<RegisterOutcome, SetBindError>
+    where
+        F: Fn(&str, bool) + Send + Sync + 'static,
+        B: Into<InputBind>,
+    {
+        self.register_v2_async_tracked(identifier, owner, callback, default_binding)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Registers a v2 asynchronous callback and returns an exact receipt.
+    pub fn register_v2_async_tracked<F, B>(
+        &self,
+        identifier: &str,
+        owner: OwnerGeneration,
+        callback: F,
+        default_binding: B,
+    ) -> Result<(RegisterOutcome, ManagedRegistrationToken), SetBindError>
     where
         F: Fn(&str, bool) + Send + Sync + 'static,
         B: Into<InputBind>,
@@ -361,7 +447,29 @@ impl ManagedInputBinds {
     where
         F: Fn(&str, bool) + Send + Sync + 'static,
     {
-        self.register_v2_async(
+        self.register_v2_async_string_tracked(
+            identifier,
+            owner,
+            callback,
+            default_binding,
+            resolver,
+        )
+        .map(|(outcome, _)| outcome)
+    }
+
+    /// Registers a textual v2 asynchronous callback and returns an exact receipt.
+    pub fn register_v2_async_string_tracked<F>(
+        &self,
+        identifier: &str,
+        owner: OwnerGeneration,
+        callback: F,
+        default_binding: &str,
+        resolver: &dyn KeyNameResolver,
+    ) -> Result<(RegisterOutcome, ManagedRegistrationToken), SetBindError>
+    where
+        F: Fn(&str, bool) + Send + Sync + 'static,
+    {
+        self.register_v2_async_tracked(
             identifier,
             owner,
             callback,
@@ -387,6 +495,7 @@ impl ManagedInputBinds {
             Callback::Release(Arc::new(callback)),
             default_binding.into(),
         )
+        .map(|(outcome, _)| outcome)
     }
 
     /// Registers a v2 synchronous down-and-release callback from a binding string.
@@ -409,20 +518,82 @@ impl ManagedInputBinds {
         )
     }
 
+    /// Creates a persisted binding without installing a callback.
+    pub fn register_default<B>(
+        &self,
+        identifier: &str,
+        default_binding: B,
+    ) -> Result<RegisterOutcome, SetBindError>
+    where
+        B: Into<InputBind>,
+    {
+        validate_identifier(identifier)?;
+        let default_binding = default_binding.into();
+        let mut state = self.lock_state();
+        if state.registry.contains_key(identifier) {
+            return Ok(RegisterOutcome::PreservedExisting);
+        }
+        let conflict = find_conflict(&state.registry, identifier, default_binding);
+        let outcome = if conflict.is_some() {
+            RegisterOutcome::ConflictCleared
+        } else {
+            RegisterOutcome::BoundDefault
+        };
+        state.registry.insert(
+            identifier.to_owned(),
+            Mapping {
+                binding: if conflict.is_some() {
+                    InputBind::default()
+                } else {
+                    default_binding.normalized()
+                },
+                ..Mapping::default()
+            },
+        );
+        Ok(outcome)
+    }
+
+    /// Creates a persisted textual binding without installing a callback.
+    pub fn register_default_string(
+        &self,
+        identifier: &str,
+        default_binding: &str,
+        resolver: &dyn KeyNameResolver,
+    ) -> Result<RegisterOutcome, SetBindError> {
+        self.register_default(identifier, parse_bind_lossy(default_binding, resolver))
+    }
+
     fn register(
         &self,
         identifier: &str,
         owner: OwnerGeneration,
         callback: Callback,
         default_binding: InputBind,
-    ) -> Result<RegisterOutcome, SetBindError> {
+    ) -> Result<(RegisterOutcome, ManagedRegistrationToken), SetBindError> {
         validate_identifier(identifier)?;
-        let registration = RegisteredCallback::new(owner, callback, self.limits);
-        let (outcome, replaced) = {
+        let token = ManagedRegistrationToken::new();
+        let mut pending = Some(RegisteredCallback::new(
+            owner,
+            callback,
+            self.limits,
+            Arc::clone(&token.marker),
+        ));
+        let update = {
             let mut state = self.lock_state();
             if let Some(existing) = state.registry.get_mut(identifier) {
-                let replaced = existing.callback.replace(registration);
-                (RegisterOutcome::PreservedExisting, replaced)
+                if existing
+                    .callback
+                    .as_ref()
+                    .is_some_and(|registration| registration.owner != owner)
+                {
+                    Err(SetBindError::ForeignHandler)
+                } else {
+                    let registration = pending
+                        .take()
+                        .expect("pending managed registration must exist");
+                    let replaced = existing.callback.replace(registration);
+                    Ok((RegisterOutcome::PreservedExisting, replaced))
+                }
             } else {
                 let conflict = find_conflict(&state.registry, identifier, default_binding);
                 let outcome = if conflict.is_some() {
@@ -430,6 +601,9 @@ impl ManagedInputBinds {
                 } else {
                     RegisterOutcome::BoundDefault
                 };
+                let registration = pending
+                    .take()
+                    .expect("pending managed registration must exist");
                 state.registry.insert(
                     identifier.to_owned(),
                     Mapping {
@@ -442,11 +616,14 @@ impl ManagedInputBinds {
                         ..Mapping::default()
                     },
                 );
-                (outcome, None)
+                Ok((outcome, None))
             }
         };
+        let abandoned = pending.take();
+        drop(abandoned);
+        let (outcome, replaced) = update?;
         drop(replaced);
-        Ok(outcome)
+        Ok((outcome, token))
     }
 
     /// Removes only the handler, retaining its persisted binding and passthrough flag.
@@ -458,6 +635,54 @@ impl ManagedInputBinds {
                 .registry
                 .get_mut(identifier)
                 .and_then(|mapping| mapping.callback.take())
+        };
+        let was_registered = removed.is_some();
+        drop(removed);
+        was_registered
+    }
+
+    /// Removes a handler only when it belongs to the authenticated owner generation.
+    pub fn deregister_for_owner(&self, identifier: &str, owner: OwnerGeneration) -> bool {
+        let removed = {
+            let mut state = self.lock_state();
+            let is_owned = state
+                .registry
+                .get(identifier)
+                .and_then(|mapping| mapping.callback.as_ref())
+                .is_some_and(|registration| registration.owner == owner);
+            if is_owned {
+                state.held.remove(identifier);
+                state
+                    .registry
+                    .get_mut(identifier)
+                    .and_then(|mapping| mapping.callback.take())
+            } else {
+                None
+            }
+        };
+        let was_registered = removed.is_some();
+        drop(removed);
+        was_registered
+    }
+
+    /// Removes only the exact callback publication represented by `token`.
+    pub fn remove_registration(&self, identifier: &str, token: &ManagedRegistrationToken) -> bool {
+        let removed = {
+            let mut state = self.lock_state();
+            let is_exact = state
+                .registry
+                .get(identifier)
+                .and_then(|mapping| mapping.callback.as_ref())
+                .is_some_and(|registration| token.matches(registration));
+            if is_exact {
+                state.held.remove(identifier);
+                state
+                    .registry
+                    .get_mut(identifier)
+                    .and_then(|mapping| mapping.callback.take())
+            } else {
+                None
+            }
         };
         let was_registered = removed.is_some();
         drop(removed);
@@ -1276,7 +1501,7 @@ mod tests {
         let engine = ManagedInputBinds::default();
         engine
             .register_v2(
-                "bind",
+                "old-bind",
                 OwnerGeneration::new(7, 1),
                 |_, _| true,
                 keyboard(0x3B),
@@ -1284,22 +1509,90 @@ mod tests {
             .expect("first generation should register");
         engine
             .register_v2(
-                "bind",
+                "new-bind",
                 OwnerGeneration::new(7, 2),
                 |_, _| true,
                 keyboard(0x3C),
             )
-            .expect("second generation should replace handler");
+            .expect("second generation should register");
         assert_eq!(
             engine.cleanup_owner_generation(OwnerGeneration::new(7, 1)),
-            0
+            1
         );
-        assert!(engine.has_handler("bind"));
+        assert!(!engine.has_handler("old-bind"));
+        assert!(engine.has_handler("new-bind"));
         assert_eq!(
             engine.cleanup_owner_generation(OwnerGeneration::new(7, 2)),
             1
         );
+        assert!(!engine.has_handler("new-bind"));
+    }
+
+    #[test]
+    fn handler_replacement_and_deregistration_are_owner_scoped() {
+        let engine = ManagedInputBinds::default();
+        let owner = OwnerGeneration::new(7, 1);
+        let foreign = OwnerGeneration::new(8, 1);
+        engine
+            .register_v2("bind", owner, |_, _| true, keyboard(0x3B))
+            .expect("first owner should register");
+
+        let error = engine
+            .register_v2("bind", foreign, |_, _| true, keyboard(0x3C))
+            .expect_err("foreign owner must not replace a live handler");
+        assert_eq!(error, SetBindError::ForeignHandler);
+        assert_eq!(engine.snapshot()[0].owner, Some(owner));
+        assert!(!engine.deregister_for_owner("bind", foreign));
+        assert!(engine.has_handler("bind"));
+        assert!(engine.deregister_for_owner("bind", owner));
         assert!(!engine.has_handler("bind"));
+    }
+
+    #[test]
+    fn stale_registration_receipt_cannot_remove_same_owner_replacement() {
+        let engine = ManagedInputBinds::default();
+        let owner = OwnerGeneration::new(7, 1);
+        let (_, stale) = engine
+            .register_v2_async_tracked("bind", owner, |_, _| {}, keyboard(0x3B))
+            .expect("first registration should succeed");
+        let (_, current) = engine
+            .register_v2_async_tracked("bind", owner, |_, _| {}, keyboard(0x3C))
+            .expect("same owner should replace its handler");
+
+        assert!(!engine.remove_registration("bind", &stale));
+        assert!(engine.has_handler("bind"));
+        assert!(engine.remove_registration("bind", &current));
+        assert!(!engine.has_handler("bind"));
+    }
+
+    #[test]
+    fn null_callback_registration_preserves_persisted_state_and_live_handler() {
+        let engine = ManagedInputBinds::default();
+        assert_eq!(
+            engine
+                .register_default_string("persisted", "F1", &UsKeyNames)
+                .expect("default should register"),
+            RegisterOutcome::BoundDefault
+        );
+        assert_eq!(engine.get("persisted"), Some(keyboard(0x3B)));
+        assert!(!engine.has_handler("persisted"));
+
+        engine
+            .register_v2(
+                "live",
+                OwnerGeneration::new(9, 1),
+                |_, _| true,
+                keyboard(0x3C),
+            )
+            .expect("live handler should register");
+        assert_eq!(
+            engine
+                .register_default("live", keyboard(0x3D))
+                .expect("existing state should be preserved"),
+            RegisterOutcome::PreservedExisting
+        );
+        assert_eq!(engine.get("live"), Some(keyboard(0x3C)));
+        assert!(engine.has_handler("live"));
     }
 
     #[test]
@@ -1326,7 +1619,7 @@ mod tests {
         engine
             .register_v2(
                 "drop-probe",
-                OwnerGeneration::new(2, 2),
+                OwnerGeneration::new(2, 1),
                 |_, _| true,
                 keyboard(0x3C),
             )
