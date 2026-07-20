@@ -174,8 +174,8 @@ impl TextureApi {
             identifier.as_str(),
             load_options(owner, false),
             None,
-            false,
             source,
+            |_error| false,
             |_error| self.service_rejected(),
         )?;
         self.finish_submission(owner)?;
@@ -205,8 +205,8 @@ impl TextureApi {
             identifier.as_str(),
             load_options(owner, true),
             callback,
-            false,
             source,
+            |error| matches!(error, BackendOperationError::ServiceRejected),
             |_error| self.service_rejected(),
         )?;
         self.finish_submission(owner)
@@ -960,6 +960,42 @@ mod tests {
         let _report = closing.service.advance();
         assert!(closing.service.get("closing").is_none());
         assert_eq!(GATED_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn synchronous_load_failure_reports_null_through_the_generation_gate() {
+        let _serial = lock(&TEST_LOCK);
+        lock(&RECEIVED).clear();
+        let harness = Harness::new();
+        let _scope = harness.enter_owner();
+        let identifier = CString::new("missing-resource").expect("identifier should be valid");
+
+        assert_eq!(
+            harness.api.load_from_resource(
+                identifier.as_ptr(),
+                41,
+                std::ptr::null_mut(),
+                Some(receive_texture),
+            ),
+            Err(BackendOperationError::ServiceRejected)
+        );
+        assert_eq!(*lock(&RECEIVED), [("missing-resource".to_owned(), 0)]);
+        assert!(harness.service.get("missing-resource").is_none());
+
+        lock(&RECEIVED).clear();
+        let closed = Harness::new();
+        let _closed_scope = closed.enter_owner();
+        closed.gate.close();
+        assert_eq!(
+            closed.api.load_from_resource(
+                identifier.as_ptr(),
+                42,
+                std::ptr::null_mut(),
+                Some(receive_texture),
+            ),
+            Err(BackendOperationError::ServiceRejected)
+        );
+        assert!(lock(&RECEIVED).is_empty());
     }
 
     #[test]

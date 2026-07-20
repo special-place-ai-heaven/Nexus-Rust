@@ -73,6 +73,31 @@ impl ImageDecoder for BlockingDecoder {
     }
 }
 
+struct SecondCallBlockingDecoder {
+    calls: AtomicUsize,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl ImageDecoder for SecondCallBlockingDecoder {
+    fn decode(
+        &self,
+        encoded: &[u8],
+        _limits: DecodeLimits,
+    ) -> Result<DecodedImage, BackendFailure> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.entered.wait();
+            self.release.wait();
+        }
+        let marker = encoded.first().copied().unwrap_or_default();
+        Ok(DecodedImage {
+            width: 1,
+            height: 1,
+            rgba8: vec![marker, marker, marker, u8::MAX],
+        })
+    }
+}
+
 struct FakeGpuTexture {
     address: NonZeroUsize,
     drops: Arc<AtomicUsize>,
@@ -367,6 +392,483 @@ fn work_queue_rejects_excess_without_unbounded_growth() {
     pump_until(&service, || {
         service.get("first").is_some() && service.get("second").is_some()
     });
+}
+
+#[test]
+fn rejected_shadow_replacement_restores_the_original_identifier() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let config = TextureConfig {
+        work_queue_capacity: 1,
+        ..TextureConfig::default()
+    };
+    let service = make_service(
+        config,
+        Arc::new(SecondCallBlockingDecoder {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        Arc::new(FakeGpu::default()),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original texture should queue");
+    pump_until(&service, || service.get("replace").is_some());
+    let original = service
+        .get("replace")
+        .expect("original texture should be registered");
+
+    service
+        .get_or_create(
+            "blocker",
+            TextureSource::Memory(vec![2]),
+            LoadOptions::default(),
+        )
+        .expect("blocking request should queue");
+    entered.wait();
+    service
+        .get_or_create(
+            "queued",
+            TextureSource::Memory(vec![3]),
+            LoadOptions::default(),
+        )
+        .expect("queued request should fill the work queue");
+
+    let replacement = service.get_or_create(
+        "replace",
+        TextureSource::Memory(vec![4]),
+        LoadOptions {
+            shadow_existing: true,
+            ..LoadOptions::default()
+        },
+    );
+
+    release.wait();
+    pump_until(&service, || {
+        service.get("blocker").is_some() && service.get("queued").is_some()
+    });
+
+    let error =
+        replacement.expect_err("replacement should be rejected while the work queue is full");
+    assert_eq!(
+        error,
+        TextureError::QueueFull(nexus_textures::QueueKind::Work)
+    );
+    let restored = service
+        .get("replace")
+        .expect("rejected replacement should restore the original identifier");
+    assert!(restored.ptr_eq(&original));
+    assert!(service.get("replace_1").is_none());
+}
+
+#[test]
+fn shadow_alias_selection_skips_pending_identifiers() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let gpu = Arc::new(FakeGpu::default());
+    let service = make_service(
+        TextureConfig::default(),
+        Arc::new(SecondCallBlockingDecoder {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        gpu.clone(),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    service
+        .get_or_create(
+            "foo",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original foo texture should queue");
+    pump_until(&service, || service.get("foo").is_some());
+    let original_address = service
+        .get("foo")
+        .expect("original foo texture should be registered")
+        .as_abi_ptr()
+        .addr();
+
+    service
+        .get_or_create(
+            "foo_1",
+            TextureSource::Memory(vec![2]),
+            LoadOptions::default(),
+        )
+        .expect("foo_1 request should queue");
+    entered.wait();
+    service
+        .get_or_create(
+            "foo",
+            TextureSource::Memory(vec![3]),
+            LoadOptions {
+                shadow_existing: true,
+                ..LoadOptions::default()
+            },
+        )
+        .expect("foo replacement should queue behind foo_1");
+
+    let foo_before_worker = service
+        .get("foo")
+        .map(|texture| texture.as_abi_ptr().addr());
+    let foo_1_before_worker = service
+        .get("foo_1")
+        .map(|texture| texture.as_abi_ptr().addr());
+    let foo_2_before_worker = service
+        .get("foo_2")
+        .map(|texture| texture.as_abi_ptr().addr());
+    release.wait();
+    pump_until(&service, || service.stats().pending_identifiers == 0);
+
+    assert!(foo_before_worker.is_none());
+    assert!(foo_1_before_worker.is_none());
+    assert_eq!(foo_2_before_worker, Some(original_address));
+
+    let foo = service
+        .get("foo")
+        .expect("replacement foo texture should be registered");
+    let foo_again = service
+        .get("foo")
+        .expect("replacement foo texture should remain registered");
+    assert!(foo.ptr_eq(&foo_again));
+
+    let foo_1 = service
+        .get("foo_1")
+        .expect("pending foo_1 texture should complete");
+    let foo_1_again = service
+        .get("foo_1")
+        .expect("completed foo_1 texture should remain registered");
+    assert!(foo_1.ptr_eq(&foo_1_again));
+
+    let foo_2 = service
+        .get("foo_2")
+        .expect("original foo texture should remain under the skipped alias");
+    let foo_2_again = service
+        .get("foo_2")
+        .expect("preserved original foo texture should remain stable");
+    assert!(foo_2.ptr_eq(&foo_2_again));
+    assert_eq!(foo_2.as_abi_ptr().addr(), original_address);
+
+    assert!(!foo.ptr_eq(&foo_1));
+    assert!(!foo.ptr_eq(&foo_2));
+    assert!(!foo_1.ptr_eq(&foo_2));
+    assert_eq!(gpu.drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *gpu.markers
+            .lock()
+            .expect("fake GPU observation lock should remain usable"),
+        [1, 2, 3]
+    );
+}
+
+#[test]
+fn failed_shadow_decode_restores_the_original_identifier() {
+    let decoder = Arc::new(FakeDecoder::default());
+    let gpu = Arc::new(FakeGpu::default());
+    let service = make_service(
+        TextureConfig::default(),
+        decoder.clone(),
+        gpu.clone(),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original texture should queue");
+    pump_until(&service, || service.get("replace").is_some());
+    let original = service
+        .get("replace")
+        .expect("original texture should be registered");
+
+    decoder.invalid.store(true, Ordering::SeqCst);
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![2]),
+            LoadOptions {
+                shadow_existing: true,
+                ..LoadOptions::default()
+            },
+        )
+        .expect("replacement should enter the decode pipeline");
+    pump_until(&service, || service.stats().pending_identifiers == 0);
+
+    let restored = service
+        .get("replace")
+        .expect("failed replacement should restore the original identifier");
+    assert!(restored.ptr_eq(&original));
+    assert!(service.get("replace_1").is_none());
+    assert_eq!(gpu.created.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn rollback_preserves_an_independent_replacement_of_the_shadow_alias() {
+    let gpu = Arc::new(FakeGpu::default());
+    let service = make_service(
+        TextureConfig::default(),
+        Arc::new(FakeDecoder::default()),
+        gpu.clone(),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original texture should queue");
+    pump_until(&service, || service.get("replace").is_some());
+    let original = service
+        .get("replace")
+        .expect("original texture should be registered");
+
+    let failed: Result<RequestOutcome, TextureError> = service.load_with_source(
+        "replace",
+        LoadOptions {
+            shadow_existing: true,
+            ..LoadOptions::default()
+        },
+        None,
+        || {
+            service.get_or_create(
+                "replace_1",
+                TextureSource::Memory(vec![3]),
+                LoadOptions {
+                    shadow_existing: true,
+                    ..LoadOptions::default()
+                },
+            )?;
+            pump_until(&service, || service.get("replace_1").is_some());
+            Err(TextureError::DecodeFailed)
+        },
+        |_error| false,
+        |error| error,
+    );
+
+    assert_eq!(
+        failed.expect_err("outer shadow replacement should fail"),
+        TextureError::DecodeFailed
+    );
+    let restored = service
+        .get("replace")
+        .expect("outer rollback should restore the original identifier");
+    assert!(restored.ptr_eq(&original));
+    let alias_replacement = service
+        .get("replace_1")
+        .expect("independent alias replacement must survive outer rollback");
+    assert!(!alias_replacement.ptr_eq(&original));
+    assert_eq!(
+        *gpu.markers
+            .lock()
+            .expect("fake GPU observation lock should remain usable"),
+        [1, 3]
+    );
+}
+
+#[test]
+fn sole_owner_cancellation_restores_pending_shadow_without_callback() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let service = make_service(
+        TextureConfig::default(),
+        Arc::new(SecondCallBlockingDecoder {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        Arc::new(FakeGpu::default()),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original texture should queue");
+    pump_until(&service, || service.get("replace").is_some());
+    let original = service
+        .get("replace")
+        .expect("original texture should be registered");
+    let owner = OwnerGeneration {
+        owner: 91,
+        generation: 1,
+    };
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let callback_count = Arc::clone(&callbacks);
+
+    service
+        .load(
+            "replace",
+            TextureSource::Memory(vec![2]),
+            LoadOptions {
+                owner: RequestOwner::Addon(owner),
+                shadow_existing: true,
+            },
+            Some(Arc::new(move |_| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .expect("owned replacement should queue");
+    entered.wait();
+
+    let removed = service.cleanup_owner_generation(owner);
+    let restored_before_worker = service.get("replace");
+    let shadow_before_worker = service.get("replace_1");
+    release.wait();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while service.stats().queued_completions == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(service.stats().queued_completions, 1);
+    let report = service.advance();
+
+    assert_eq!(removed, 1);
+    let restored = restored_before_worker
+        .expect("sole-owner cancellation should immediately restore the original identifier");
+    assert!(restored.ptr_eq(&original));
+    assert!(shadow_before_worker.is_none());
+    assert_eq!(report.completions, 1);
+    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    let current = service
+        .get("replace")
+        .expect("stale worker completion must leave the original registered");
+    assert!(current.ptr_eq(&original));
+    assert!(service.get("replace_1").is_none());
+}
+
+#[test]
+fn shared_shadow_cancellation_waits_for_the_last_owner() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let service = make_service(
+        TextureConfig::default(),
+        Arc::new(SecondCallBlockingDecoder {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        Arc::new(FakeGpu::default()),
+        Arc::new(FakeDownloader::default()),
+        Arc::new(NoOverrides),
+        Arc::new(FakeResources {
+            bytes: vec![1],
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    service
+        .get_or_create(
+            "replace",
+            TextureSource::Memory(vec![1]),
+            LoadOptions::default(),
+        )
+        .expect("original texture should queue");
+    pump_until(&service, || service.get("replace").is_some());
+    let original = service
+        .get("replace")
+        .expect("original texture should be registered");
+    let first_owner = OwnerGeneration {
+        owner: 92,
+        generation: 1,
+    };
+    let second_owner = OwnerGeneration {
+        owner: 93,
+        generation: 1,
+    };
+    let first_callbacks = Arc::new(AtomicUsize::new(0));
+    let second_callbacks = Arc::new(AtomicUsize::new(0));
+    let first_count = Arc::clone(&first_callbacks);
+
+    service
+        .load(
+            "replace",
+            TextureSource::Memory(vec![2]),
+            LoadOptions {
+                owner: RequestOwner::Addon(first_owner),
+                shadow_existing: true,
+            },
+            Some(Arc::new(move |_| {
+                first_count.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .expect("first owner replacement should queue");
+    entered.wait();
+
+    let second_count = Arc::clone(&second_callbacks);
+    let joined = service.load(
+        "replace",
+        TextureSource::Memory(vec![3]),
+        LoadOptions {
+            owner: RequestOwner::Addon(second_owner),
+            shadow_existing: true,
+        },
+        Some(Arc::new(move |_| {
+            second_count.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let removed = service.cleanup_owner_generation(first_owner);
+    let original_key_before_worker = service.get("replace");
+    let shadow_before_worker = service.get("replace_1");
+    release.wait();
+    pump_until(&service, || service.get("replace").is_some());
+
+    assert!(matches!(
+        joined.expect("second owner should join the replacement"),
+        RequestOutcome::Joined
+    ));
+    assert_eq!(removed, 1);
+    assert!(original_key_before_worker.is_none());
+    let shadow =
+        shadow_before_worker.expect("shared pending replacement should retain the original shadow");
+    assert!(shadow.ptr_eq(&original));
+    assert_eq!(first_callbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(second_callbacks.load(Ordering::SeqCst), 1);
+    let replacement = service
+        .get("replace")
+        .expect("surviving owner should receive the completed replacement");
+    assert!(!replacement.ptr_eq(&original));
+    let shadow = service
+        .get("replace_1")
+        .expect("successful replacement should preserve the old texture shadow");
+    assert!(shadow.ptr_eq(&original));
 }
 
 #[test]

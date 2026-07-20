@@ -260,6 +260,12 @@ struct PendingRequest {
     request_id: u64,
     owners: HashSet<RequestOwner>,
     callbacks: Vec<CallbackRegistration>,
+    shadowed: Option<ShadowedTexture>,
+}
+
+struct ShadowedTexture {
+    alias: Arc<str>,
+    texture: TextureHandle,
 }
 
 #[derive(Default)]
@@ -444,20 +450,19 @@ impl TextureService {
     /// Pending and cached reservations are resolved before the source provider
     /// is called, and an encoded override wins before native source acquisition.
     /// The provider runs synchronously without a service lock.
-    /// attach_joined_callback retains the core service's callback fan-out when
-    /// true; ABI compatibility adapters pass false because the legacy host
-    /// ignored later callbacks for an identifier that was already queued.
+    /// The lazy path preserves the legacy host's behavior of ignoring later
+    /// callbacks for an identifier that was already queued.
     ///
     /// Service failures are converted with map_service_error. A provider error
-    /// is returned unchanged, and the primary callback is removed before any
-    /// joined callbacks receive a closed failure.
+    /// is returned unchanged. notify_provider_error decides whether the primary
+    /// callback receives that provider failure; joined callbacks always do.
     pub fn load_with_source<E>(
         &self,
         identifier: &str,
         options: LoadOptions,
         callback: Option<TextureCallback>,
-        attach_joined_callback: bool,
         source: impl FnOnce() -> Result<TextureSource, E>,
+        notify_provider_error: impl FnOnce(&E) -> bool,
         map_service_error: impl Fn(TextureError) -> E,
     ) -> Result<RequestOutcome, E> {
         self.validate_identifier(identifier)
@@ -468,7 +473,7 @@ impl TextureService {
 
         let identifier: Arc<str> = Arc::from(identifier);
         let reserved = self
-            .reserve_request(&identifier, options, callback, attach_joined_callback)
+            .reserve_request(&identifier, options, callback, false)
             .map_err(&map_service_error)?;
         let Reservation::New {
             request_id,
@@ -486,11 +491,14 @@ impl TextureService {
                 let source = match source() {
                     Ok(source) => source,
                     Err(error) => {
+                        let excluded_callback_id = (!notify_provider_error(&error))
+                            .then_some(primary_callback_id)
+                            .flatten();
                         self.fail_reserved_excluding(
                             &identifier,
                             request_id,
                             TextureError::DecodeFailed,
-                            primary_callback_id,
+                            excluded_callback_id,
                         );
                         return Err(error);
                     }
@@ -498,24 +506,19 @@ impl TextureService {
                 match self.resolve_source(source) {
                     Ok(source) => source,
                     Err(error) => {
-                        self.fail_reserved_excluding(
-                            &identifier,
-                            request_id,
-                            error,
-                            primary_callback_id,
-                        );
+                        self.fail_reserved(&identifier, request_id, error);
                         return Err(map_service_error(error));
                     }
                 }
             }
             Err(error) => {
-                self.fail_reserved_excluding(&identifier, request_id, error, primary_callback_id);
+                self.fail_reserved(&identifier, request_id, error);
                 return Err(map_service_error(error));
             }
         };
 
         if let Err(error) = self.queue_resolved(&identifier, request_id, resolved) {
-            self.fail_reserved_excluding(&identifier, request_id, error, primary_callback_id);
+            self.fail_reserved(&identifier, request_id, error);
             return Err(map_service_error(error));
         }
         Ok(RequestOutcome::Queued)
@@ -552,17 +555,27 @@ impl TextureService {
         let mut removed = 0;
         {
             let mut state = self.lock_state();
-            state.pending.retain(|_, pending| {
-                pending.callbacks.retain(|registration| {
-                    let keep = registration.owner != target;
-                    if !keep {
-                        removed += 1;
-                    }
-                    keep
-                });
-                pending.owners.remove(&target);
-                !pending.owners.is_empty() || !pending.callbacks.is_empty()
-            });
+            let cancelled = state
+                .pending
+                .iter_mut()
+                .filter_map(|(identifier, pending)| {
+                    pending.callbacks.retain(|registration| {
+                        let keep = registration.owner != target;
+                        if !keep {
+                            removed += 1;
+                        }
+                        keep
+                    });
+                    pending.owners.remove(&target);
+                    (pending.owners.is_empty() && pending.callbacks.is_empty())
+                        .then(|| Arc::clone(identifier))
+                })
+                .collect::<Vec<_>>();
+            for identifier in cancelled {
+                if let Some(pending) = state.pending.remove(identifier.as_ref()) {
+                    restore_shadow(&mut state.registry, &identifier, pending.shadowed);
+                }
+            }
         }
         self.shared
             .completions
@@ -618,7 +631,7 @@ impl TextureService {
             return Ok(Reservation::Joined);
         }
 
-        if !options.shadow_existing {
+        let shadowed = if !options.shadow_existing {
             if let Some(texture) = state.registry.get(identifier.as_ref()).cloned() {
                 return Ok(Reservation::Cached {
                     texture,
@@ -627,9 +640,10 @@ impl TextureService {
                     identifier: Arc::clone(identifier),
                 });
             }
+            None
         } else {
-            shadow_texture(&mut state.registry, identifier);
-        }
+            shadow_texture(&mut state, identifier)
+        };
 
         let request_id = state.next_request_id;
         state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
@@ -643,6 +657,7 @@ impl TextureService {
                 request_id,
                 owners,
                 callbacks,
+                shadowed,
             },
         );
         Ok(Reservation::New {
@@ -800,10 +815,15 @@ impl TextureService {
             let Some(pending) = state.pending.remove(identifier.as_ref()) else {
                 return;
             };
-            if let Ok(texture) = &result {
-                state
-                    .registry
-                    .insert(Arc::clone(&identifier), texture.clone());
+            match &result {
+                Ok(texture) => {
+                    state
+                        .registry
+                        .insert(Arc::clone(&identifier), texture.clone());
+                }
+                Err(_) => {
+                    restore_shadow(&mut state.registry, &identifier, pending.shadowed);
+                }
             }
             pending.callbacks
         };
@@ -829,17 +849,18 @@ impl TextureService {
         let callbacks = {
             let mut state = self.lock_state();
             match state.pending.get(identifier.as_ref()) {
-                Some(pending) if pending.request_id == request_id => state
-                    .pending
-                    .remove(identifier.as_ref())
-                    .map(|pending| {
-                        pending
-                            .callbacks
-                            .into_iter()
-                            .filter(|registration| Some(registration.id) != excluded_callback_id)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                Some(pending) if pending.request_id == request_id => {
+                    let pending = state
+                        .pending
+                        .remove(identifier.as_ref())
+                        .expect("matching pending request must remain present");
+                    restore_shadow(&mut state.registry, identifier, pending.shadowed);
+                    pending
+                        .callbacks
+                        .into_iter()
+                        .filter(|registration| Some(registration.id) != excluded_callback_id)
+                        .collect()
+                }
                 _ => Vec::new(),
             }
         };
@@ -1041,19 +1062,39 @@ fn validate_decoded(image: &DecodedImage, config: TextureConfig) -> Result<(), T
     Ok(())
 }
 
-fn shadow_texture(registry: &mut HashMap<Arc<str>, TextureHandle>, identifier: &Arc<str>) {
-    let Some(texture) = registry.remove(identifier.as_ref()) else {
-        return;
-    };
+fn shadow_texture(state: &mut RegistryState, identifier: &Arc<str>) -> Option<ShadowedTexture> {
+    let texture = state.registry.remove(identifier.as_ref())?;
     let mut suffix = 1_u64;
     loop {
-        let shadow: Arc<str> = Arc::from(format!("{identifier}_{suffix}"));
-        if let std::collections::hash_map::Entry::Vacant(entry) = registry.entry(shadow) {
-            entry.insert(texture);
-            return;
+        let alias: Arc<str> = Arc::from(format!("{identifier}_{suffix}"));
+        if !state.registry.contains_key(alias.as_ref())
+            && !state.pending.contains_key(alias.as_ref())
+        {
+            state.registry.insert(Arc::clone(&alias), texture.clone());
+            return Some(ShadowedTexture { alias, texture });
         }
         suffix = suffix.saturating_add(1);
     }
+}
+
+fn restore_shadow(
+    registry: &mut HashMap<Arc<str>, TextureHandle>,
+    identifier: &Arc<str>,
+    shadowed: Option<ShadowedTexture>,
+) {
+    let Some(shadowed) = shadowed else {
+        return;
+    };
+    if registry.contains_key(identifier.as_ref()) {
+        return;
+    }
+    if registry
+        .get(shadowed.alias.as_ref())
+        .is_some_and(|current| current.ptr_eq(&shadowed.texture))
+    {
+        registry.remove(shadowed.alias.as_ref());
+    }
+    registry.insert(Arc::clone(identifier), shadowed.texture);
 }
 
 fn stop_shared(shared: &Shared) {
