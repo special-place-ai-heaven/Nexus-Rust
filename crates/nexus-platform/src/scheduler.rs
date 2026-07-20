@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -175,6 +175,7 @@ struct TaskControl {
 pub struct MinimalScheduler {
     shared: Arc<Shared>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+    worker_ids: Vec<ThreadId>,
 }
 
 impl std::fmt::Debug for MinimalScheduler {
@@ -282,10 +283,19 @@ impl MinimalScheduler {
                 })?;
             workers.push(handle);
         }
+        let worker_ids = workers.iter().map(|worker| worker.thread().id()).collect();
         Ok(Self {
             shared,
             workers: Mutex::new(workers),
+            worker_ids,
         })
+    }
+
+    /// Returns whether the caller is one of this scheduler's worker threads.
+    #[must_use]
+    pub fn is_worker_thread(&self) -> bool {
+        let current = thread::current().id();
+        self.worker_ids.contains(&current)
     }
 
     /// Submits a one-shot task.
@@ -519,6 +529,23 @@ mod tests {
         assert_eq!(high.wait(), TaskOutcome::Completed);
         assert_eq!(low.wait(), TaskOutcome::Completed);
         assert_eq!(*lock_unpoison(&order), ["high", "low"]);
+        scheduler
+            .shutdown_and_drain()
+            .expect("workers should drain");
+    }
+
+    #[test]
+    fn worker_identity_remains_available_to_scheduled_work() {
+        let scheduler =
+            Arc::new(MinimalScheduler::with_worker_count(1).expect("test worker should start"));
+        assert!(!scheduler.is_worker_thread());
+        let observed = Arc::clone(&scheduler);
+        let task = scheduler
+            .submit(TaskPriority::Normal, move |_| {
+                assert!(observed.is_worker_thread());
+            })
+            .expect("identity task should submit");
+        assert_eq!(task.wait(), TaskOutcome::Completed);
         scheduler
             .shutdown_and_drain()
             .expect("workers should drain");

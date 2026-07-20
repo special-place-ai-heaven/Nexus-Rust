@@ -20,8 +20,8 @@ pub use capture::{CaptureOutcome, InputCapture, InputMessage};
 pub use error::{GameInputError, GameSinkError, PersistenceError};
 pub use game::{
     GameBindRegistry, GameDispatch, GameInvoker, GameMessage, GameMessageSink, GameOnlyMessageSink,
-    GameSlot, InvokeState, MultiInputBind, PhysicalInputState, game_scan_code_to_scan_code,
-    scan_code_to_game_scan_code,
+    GamePressToken, GameSlot, InvokeState, MultiInputBind, PhysicalInputState,
+    game_scan_code_to_scan_code, scan_code_to_game_scan_code,
 };
 pub use game_ids::{GameBindId, KnownGameBind, known_game_binds};
 pub use managed::{

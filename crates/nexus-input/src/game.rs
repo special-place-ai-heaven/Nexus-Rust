@@ -96,6 +96,16 @@ impl GameBindRegistry {
             .is_some()
     }
 
+    /// Returns whether the exact, unmigrated action has either slot bound.
+    #[must_use]
+    pub fn is_bound_exact(&self, action: GameBindId) -> bool {
+        self.bindings
+            .get(&action)
+            .copied()
+            .and_then(MultiInputBind::selected)
+            .is_some()
+    }
+
     /// Sets one slot. The removed legacy swim-up action is ignored.
     pub fn set(&mut self, action: GameBindId, slot: GameSlot, binding: InputBind) -> bool {
         if action == GameBindId::LEGACY_MOVE_SWIM_UP {
@@ -393,10 +403,20 @@ pub struct GameDispatch {
     pub release_due_millis: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Exact receipt for one currently active game-bind press.
+///
+/// A receipt can release only the press generation that created it. This
+/// prevents a delayed release from affecting a later press of the same action.
+#[derive(Clone, Debug)]
+pub struct GamePressToken {
+    marker: Arc<()>,
+}
+
+#[derive(Debug, Clone)]
 struct ActivePress {
-    binding: InputBind,
+    bindings: Vec<InputBind>,
     release_due_millis: Option<u64>,
+    marker: Arc<()>,
 }
 
 /// Deterministic press/release/invoke-duration state machine.
@@ -436,6 +456,55 @@ impl GameInvoker {
 
     /// Presses an action once.
     pub fn press(&mut self, action: GameBindId) -> Result<GameDispatch, GameInputError> {
+        self.press_new_tracked(action)
+            .map(|(dispatch, _token)| dispatch)
+    }
+
+    /// Presses an action and returns an exact release receipt.
+    ///
+    /// When the action is already active, its original binding is emitted
+    /// again and the existing press receipt is returned. This matches native
+    /// repeat-press behavior without weakening stale-release protection.
+    pub fn press_repeated(
+        &mut self,
+        action: GameBindId,
+    ) -> Result<(GameDispatch, GamePressToken), GameInputError> {
+        let action = action.canonical();
+        if let Some(marker) = self
+            .active
+            .get(&action)
+            .map(|active| Arc::clone(&active.marker))
+        {
+            let binding = self
+                .registry
+                .get(action)
+                .and_then(MultiInputBind::selected)
+                .ok_or(GameInputError::Unbound)?;
+            let physical = self.poll_modifiers()?;
+            let messages = press_messages(binding, physical)?;
+            self.send(&messages)?;
+            if let Some(active) = self.active.get_mut(&action)
+                && !active.bindings.contains(&binding)
+            {
+                active.bindings.push(binding);
+            }
+            return Ok((
+                GameDispatch {
+                    action,
+                    state: InvokeState::Pressed,
+                    message_count: messages.len(),
+                    release_due_millis: None,
+                },
+                GamePressToken { marker },
+            ));
+        }
+        self.press_new_tracked(action)
+    }
+
+    fn press_new_tracked(
+        &mut self,
+        action: GameBindId,
+    ) -> Result<(GameDispatch, GamePressToken), GameInputError> {
         let action = action.canonical();
         if self.active.contains_key(&action) {
             return Err(GameInputError::AlreadyPressed);
@@ -448,32 +517,45 @@ impl GameInvoker {
         let physical = self.poll_modifiers()?;
         let messages = press_messages(binding, physical)?;
         self.send(&messages)?;
+        let marker = Arc::new(());
         self.active.insert(
             action,
             ActivePress {
-                binding,
+                bindings: vec![binding],
                 release_due_millis: None,
+                marker: Arc::clone(&marker),
             },
         );
-        Ok(GameDispatch {
-            action,
-            state: InvokeState::Pressed,
-            message_count: messages.len(),
-            release_due_millis: None,
-        })
+        Ok((
+            GameDispatch {
+                action,
+                state: InvokeState::Pressed,
+                message_count: messages.len(),
+                release_due_millis: None,
+            },
+            GamePressToken { marker },
+        ))
     }
 
     /// Releases an action. If it was not tracked, current bindings are used for API parity.
     pub fn release(&mut self, action: GameBindId) -> Result<GameDispatch, GameInputError> {
         let action = action.canonical();
-        let binding = self
+        let bindings = self
             .active
             .get(&action)
-            .map(|active| active.binding)
-            .or_else(|| self.registry.get(action).and_then(MultiInputBind::selected))
+            .map(|active| active.bindings.clone())
+            .or_else(|| {
+                self.registry
+                    .get(action)
+                    .and_then(MultiInputBind::selected)
+                    .map(|binding| vec![binding])
+            })
             .ok_or(GameInputError::Unbound)?;
         let physical = self.poll_modifiers()?;
-        let messages = release_messages(binding, physical)?;
+        let mut messages = Vec::new();
+        for binding in bindings.into_iter().rev() {
+            messages.extend(release_messages(binding, physical)?);
+        }
         self.send(&messages)?;
         self.active.remove(&action);
         Ok(GameDispatch {
@@ -482,6 +564,23 @@ impl GameInvoker {
             message_count: messages.len(),
             release_due_millis: None,
         })
+    }
+
+    /// Releases an action only while the exact tracked press is still active.
+    pub fn release_tracked(
+        &mut self,
+        action: GameBindId,
+        token: &GamePressToken,
+    ) -> Result<Option<GameDispatch>, GameInputError> {
+        let action = action.canonical();
+        if !self
+            .active
+            .get(&action)
+            .is_some_and(|active| Arc::ptr_eq(&active.marker, &token.marker))
+        {
+            return Ok(None);
+        }
+        self.release(action).map(Some)
     }
 
     /// Presses now and releases immediately or after a logical duration.
@@ -531,10 +630,19 @@ impl GameInvoker {
     /// Releases every tracked action, for focus loss and shutdown.
     pub fn release_all(&mut self) -> Result<Vec<GameDispatch>, GameInputError> {
         let actions: Vec<GameBindId> = self.active.keys().copied().collect();
-        actions
-            .into_iter()
-            .map(|action| self.release(action))
-            .collect()
+        let mut dispatches = Vec::with_capacity(actions.len());
+        let mut first_error = None;
+        for action in actions {
+            match self.release(action) {
+                Ok(dispatch) => dispatches.push(dispatch),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(dispatches),
+        }
     }
 
     /// Returns whether this state machine currently holds an action.
@@ -1449,6 +1557,7 @@ const DEFAULT_BOUND_BINDS: &[DefaultBinding] = &[
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicU16, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
@@ -1482,6 +1591,34 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[derive(Default)]
+    struct SelectiveReleaseSink {
+        fail_scan_code: AtomicU16,
+        release_attempts: Mutex<Vec<u16>>,
+    }
+
+    impl GameMessageSink for SelectiveReleaseSink {
+        fn send_batch(&self, messages: &[GameMessage]) -> Result<(), GameSinkError> {
+            for message in messages {
+                if let GameMessage::Keyboard {
+                    scan_code,
+                    pressed: false,
+                    ..
+                } = message
+                {
+                    self.release_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(*scan_code);
+                    if *scan_code == self.fail_scan_code.load(Ordering::Relaxed) {
+                        return Err(GameSinkError);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn full_scan_code_table_round_trips() {
         for (game, scan) in GAME_SCAN_CODES {
@@ -1506,6 +1643,8 @@ mod tests {
         );
         assert!(registry.is_bound(GameBindId::SKILL_WEAPON_1));
         assert!(!registry.is_bound(GameBindId::MOVE_WALK));
+        assert!(registry.is_bound(GameBindId::LEGACY_MOVE_SWIM_UP));
+        assert!(!registry.is_bound_exact(GameBindId::LEGACY_MOVE_SWIM_UP));
     }
 
     #[test]
@@ -1632,6 +1771,107 @@ mod tests {
             .press(GameBindId::LEGACY_MOVE_SWIM_UP)
             .expect("legacy alias should press merged action");
         assert_eq!(dispatch.action, GameBindId::MOVE_JUMP_SWIM_UP_FLY_UP);
+    }
+
+    #[test]
+    fn repeated_press_emits_again_and_stale_receipt_cannot_release_replacement() {
+        let sink = Arc::new(RecordingSink::default());
+        let physical = Arc::new(FixedPhysical(ModifierState::default()));
+        let mut invoker =
+            GameInvoker::new(GameBindRegistry::with_defaults(), sink.clone(), physical);
+
+        let (_first, first_token) = invoker
+            .press_repeated(GameBindId::MOVE_FORWARD)
+            .expect("first press should dispatch");
+        invoker.registry_mut().set(
+            GameBindId::MOVE_FORWARD,
+            GameSlot::Primary,
+            InputBind::new(false, false, false, InputDevice::KEYBOARD, 0x2D),
+        );
+        let (_repeated, repeated_token) = invoker
+            .press_repeated(GameBindId::MOVE_FORWARD)
+            .expect("repeat press should dispatch");
+        assert_eq!(
+            batches(&sink)[0],
+            [GameMessage::Keyboard {
+                scan_code: 0x11,
+                pressed: true,
+                system: false,
+            }]
+        );
+        assert_eq!(
+            batches(&sink)[1],
+            [GameMessage::Keyboard {
+                scan_code: 0x2D,
+                pressed: true,
+                system: false,
+            }]
+        );
+        assert!(
+            invoker
+                .release_tracked(GameBindId::MOVE_FORWARD, &first_token)
+                .expect("current receipt should release")
+                .is_some()
+        );
+        let released_scan_codes = batches(&sink)[2]
+            .iter()
+            .filter_map(|message| match message {
+                GameMessage::Keyboard {
+                    scan_code,
+                    pressed: false,
+                    ..
+                } => Some(*scan_code),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(released_scan_codes, [0x2D, 0x11]);
+
+        let (_replacement, replacement_token) = invoker
+            .press_repeated(GameBindId::MOVE_FORWARD)
+            .expect("replacement press should dispatch");
+        assert!(
+            invoker
+                .release_tracked(GameBindId::MOVE_FORWARD, &repeated_token)
+                .expect("stale receipt should be ignored")
+                .is_none()
+        );
+        assert!(invoker.is_pressed(GameBindId::MOVE_FORWARD));
+        assert!(
+            invoker
+                .release_tracked(GameBindId::MOVE_FORWARD, &replacement_token)
+                .expect("replacement receipt should release")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn release_all_attempts_later_actions_after_one_release_fails() {
+        let sink = Arc::new(SelectiveReleaseSink::default());
+        let physical = Arc::new(FixedPhysical(ModifierState::default()));
+        let mut invoker =
+            GameInvoker::new(GameBindRegistry::with_defaults(), sink.clone(), physical);
+        invoker
+            .press(GameBindId::MOVE_FORWARD)
+            .expect("forward press should dispatch");
+        invoker
+            .press(GameBindId::MOVE_BACKWARD)
+            .expect("backward press should dispatch");
+        sink.fail_scan_code.store(0x11, Ordering::Relaxed);
+
+        assert_eq!(invoker.release_all(), Err(GameInputError::SinkFailed));
+        assert_eq!(
+            *sink
+                .release_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [0x11, 0x1F]
+        );
+        assert!(invoker.is_pressed(GameBindId::MOVE_FORWARD));
+        assert!(!invoker.is_pressed(GameBindId::MOVE_BACKWARD));
+
+        sink.fail_scan_code.store(0, Ordering::Relaxed);
+        assert!(invoker.release_all().is_ok());
+        assert!(!invoker.is_pressed(GameBindId::MOVE_FORWARD));
     }
 
     #[test]
