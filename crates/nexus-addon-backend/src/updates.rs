@@ -109,6 +109,32 @@ impl UpdateApi {
         mutex_lock(&self.state).closed = true;
     }
 
+    /// Cancels unclaimed requests for one exact add-on generation.
+    ///
+    /// The caller must close the owner's callback gate before invoking this
+    /// barrier. Requests already claimed with [`Self::try_dequeue`] remain the
+    /// coordinator's responsibility.
+    pub fn cancel_owner(&self, owner: OwnerToken) -> usize {
+        let mut state = mutex_lock(&self.state);
+        let before = state.requests.len();
+        state.requests.retain(|request| request.owner != owner);
+        before.saturating_sub(state.requests.len())
+    }
+
+    /// Closes admission and transfers every unclaimed request in FIFO order.
+    ///
+    /// Repeated calls return an empty collection. Requests are converted after
+    /// releasing the queue lock so consumer destruction cannot run inside it.
+    #[must_use]
+    pub fn close_and_drain(&self) -> Vec<AddonUpdateRequest> {
+        let requests = {
+            let mut state = mutex_lock(&self.state);
+            state.closed = true;
+            std::mem::take(&mut state.requests)
+        };
+        requests.into_iter().collect()
+    }
+
     fn request_update(
         &self,
         signature: i32,
@@ -120,6 +146,7 @@ impl UpdateApi {
         if signature == 0 || signature_bits != owner.signature || update_url.is_empty() {
             return self.service_rejected();
         }
+        let gate = self.boundary.callback_gate_for_current(owner)?;
 
         let request = AddonUpdateRequest {
             owner,
@@ -127,7 +154,7 @@ impl UpdateApi {
             update_url: update_url.into_string(),
         };
         let mut state = mutex_lock(&self.state);
-        if state.closed || state.requests.len() >= self.capacity.get() {
+        if state.closed || !gate.is_open() || state.requests.len() >= self.capacity.get() {
             drop(state);
             return self.service_rejected();
         }
@@ -175,41 +202,79 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use core::num::NonZeroUsize;
     use std::ffi::CString;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use nexus_addon_ffi::{AddonCallerResolver, AddressOwnerResolver};
-    use nexus_core::OwnerToken;
+    use nexus_core::{CallbackGate, OwnerToken};
     use nexus_native_memory::NativeMemoryReader;
 
-    use super::UpdateApi;
+    use super::{AddonUpdateRequest, UpdateApi};
     use crate::{BackendFailures, UpdateBackend};
 
     const OWNER: OwnerToken = OwnerToken {
         signature: 0xA11D_0042,
         generation: 7,
     };
+    const RELOADED_OWNER: OwnerToken = OwnerToken {
+        signature: OWNER.signature,
+        generation: OWNER.generation + 1,
+    };
+    const OTHER_OWNER: OwnerToken = OwnerToken {
+        signature: OWNER.signature + 1,
+        generation: 3,
+    };
 
-    struct CurrentOwner;
+    struct CurrentOwners {
+        owner: Arc<CallbackGate>,
+        reloaded: Arc<CallbackGate>,
+        other: Arc<CallbackGate>,
+    }
 
-    impl AddressOwnerResolver for CurrentOwner {
+    impl CurrentOwners {
+        fn new() -> Self {
+            Self {
+                owner: Arc::new(CallbackGate::open()),
+                reloaded: Arc::new(CallbackGate::open()),
+                other: Arc::new(CallbackGate::open()),
+            }
+        }
+
+        fn gate(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+            match owner {
+                OWNER => Some(Arc::clone(&self.owner)),
+                RELOADED_OWNER => Some(Arc::clone(&self.reloaded)),
+                OTHER_OWNER => Some(Arc::clone(&self.other)),
+                _ => None,
+            }
+        }
+    }
+
+    impl AddressOwnerResolver for CurrentOwners {
         fn owner_for_address(&self, _address: NonZeroUsize) -> Option<OwnerToken> {
             None
         }
 
         fn is_current_owner(&self, owner: OwnerToken) -> bool {
-            owner == OWNER
+            self.gate(owner).is_some()
+        }
+
+        fn callback_gate_for_current(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+            self.gate(owner)
         }
     }
 
     struct Harness {
         api: UpdateApi,
         callers: Arc<AddonCallerResolver>,
+        owners: Arc<CurrentOwners>,
         failures: Arc<BackendFailures>,
     }
 
     impl Harness {
         fn new(capacity: usize) -> Self {
-            let callers = Arc::new(AddonCallerResolver::new(Arc::new(CurrentOwner)));
+            let owners = Arc::new(CurrentOwners::new());
+            let callers = Arc::new(AddonCallerResolver::new(owners.clone()));
             let failures = Arc::new(BackendFailures::new());
             let boundary = Arc::new(crate::NativeCallBoundary::new(
                 Arc::clone(&callers),
@@ -220,13 +285,18 @@ mod tests {
             Self {
                 api: UpdateApi::with_capacity(boundary, capacity),
                 callers,
+                owners,
                 failures,
             }
         }
 
         fn enter_owner(&self) -> nexus_addon_ffi::AddonOwnerScope {
+            self.enter_exact_owner(OWNER)
+        }
+
+        fn enter_exact_owner(&self, owner: OwnerToken) -> nexus_addon_ffi::AddonOwnerScope {
             self.callers
-                .enter_owner_scope(OWNER)
+                .enter_owner_scope(owner)
                 .expect("test owner should be current")
         }
     }
@@ -325,6 +395,159 @@ mod tests {
             "https://updates.invalid/first"
         );
         assert_eq!(harness.failures.snapshot().service_rejected, 2);
+    }
+
+    #[test]
+    fn owner_cancellation_is_generation_exact_and_preserves_survivor_fifo() {
+        let harness = Harness::new(4);
+        let owner_first = CString::new("https://updates.invalid/owner-first").expect("valid URL");
+        let reloaded = CString::new("https://updates.invalid/reloaded").expect("valid URL");
+        let other = CString::new("https://updates.invalid/other").expect("valid URL");
+        let owner_last = CString::new("https://updates.invalid/owner-last").expect("valid URL");
+
+        {
+            let _scope = harness.enter_exact_owner(OWNER);
+            harness
+                .api
+                .request_update(signature(), owner_first.as_ptr())
+                .expect("first owner request should queue");
+        }
+        {
+            let _scope = harness.enter_exact_owner(RELOADED_OWNER);
+            harness
+                .api
+                .request_update(signature(), reloaded.as_ptr())
+                .expect("reloaded generation request should queue");
+        }
+        {
+            let _scope = harness.enter_exact_owner(OTHER_OWNER);
+            harness
+                .api
+                .request_update(
+                    i32::from_ne_bytes(OTHER_OWNER.signature.to_ne_bytes()),
+                    other.as_ptr(),
+                )
+                .expect("other owner request should queue");
+        }
+        {
+            let _scope = harness.enter_exact_owner(OWNER);
+            harness
+                .api
+                .request_update(signature(), owner_last.as_ptr())
+                .expect("last owner request should queue");
+        }
+
+        assert_eq!(harness.api.cancel_owner(OWNER), 2);
+        assert_eq!(harness.api.cancel_owner(OWNER), 0);
+        assert_eq!(harness.api.pending_len(), 2);
+        let reloaded = harness
+            .api
+            .try_dequeue()
+            .expect("reloaded request survives");
+        let other = harness.api.try_dequeue().expect("other request survives");
+        assert_eq!(reloaded.owner(), RELOADED_OWNER);
+        assert_eq!(reloaded.update_url(), "https://updates.invalid/reloaded");
+        assert_eq!(other.owner(), OTHER_OWNER);
+        assert_eq!(other.update_url(), "https://updates.invalid/other");
+        assert_eq!(harness.failures.snapshot().service_rejected, 0);
+    }
+
+    #[test]
+    fn closed_owner_cannot_publish_after_cleanup_barrier() {
+        let harness = Harness::new(2);
+        let first = CString::new("https://updates.invalid/first").expect("valid URL");
+        let late = CString::new("https://updates.invalid/late").expect("valid URL");
+        let _scope = harness.enter_owner();
+
+        harness
+            .api
+            .request_update(signature(), first.as_ptr())
+            .expect("request before cleanup should queue");
+        assert!(harness.owners.owner.close());
+        assert_eq!(harness.api.cancel_owner(OWNER), 1);
+        assert!(
+            harness
+                .api
+                .request_update(signature(), late.as_ptr())
+                .is_err()
+        );
+        assert_eq!(harness.api.pending_len(), 0);
+        assert_eq!(harness.failures.snapshot().service_rejected, 1);
+    }
+
+    #[test]
+    fn concurrent_publication_and_cleanup_leave_no_late_request() {
+        let harness = Arc::new(Harness::new(1));
+        let start = Arc::new(Barrier::new(3));
+
+        let publication_harness = Arc::clone(&harness);
+        let publication_start = Arc::clone(&start);
+        let publication = thread::spawn(move || {
+            let url = CString::new("https://updates.invalid/racing").expect("valid URL");
+            let _scope = publication_harness.enter_owner();
+            publication_start.wait();
+            publication_harness
+                .api
+                .request_update(signature(), url.as_ptr())
+        });
+
+        let cleanup_harness = Arc::clone(&harness);
+        let cleanup_start = Arc::clone(&start);
+        let cleanup = thread::spawn(move || {
+            cleanup_start.wait();
+            let _closed = cleanup_harness.owners.owner.close();
+            cleanup_harness.api.cancel_owner(OWNER)
+        });
+
+        start.wait();
+        let publication = publication
+            .join()
+            .expect("publication thread should not panic");
+        let cancelled = cleanup.join().expect("cleanup thread should not panic");
+        match publication {
+            Ok(()) => assert_eq!(cancelled, 1),
+            Err(_) => assert_eq!(cancelled, 0),
+        }
+        assert_eq!(harness.api.pending_len(), 0);
+    }
+
+    #[test]
+    fn close_and_drain_transfers_each_request_once_in_fifo_order() {
+        let harness = Harness::new(3);
+        let first = CString::new("https://updates.invalid/first").expect("valid URL");
+        let second = CString::new("https://updates.invalid/second").expect("valid URL");
+        let late = CString::new("https://updates.invalid/late").expect("valid URL");
+        let _scope = harness.enter_owner();
+
+        harness
+            .api
+            .request_update(signature(), first.as_ptr())
+            .expect("first request should queue");
+        harness
+            .api
+            .request_update(signature(), second.as_ptr())
+            .expect("second request should queue");
+
+        let drained = harness.api.close_and_drain();
+        assert_eq!(
+            drained
+                .iter()
+                .map(AddonUpdateRequest::update_url)
+                .collect::<Vec<_>>(),
+            [
+                "https://updates.invalid/first",
+                "https://updates.invalid/second"
+            ]
+        );
+        assert!(harness.api.close_and_drain().is_empty());
+        assert!(
+            harness
+                .api
+                .request_update(signature(), late.as_ptr())
+                .is_err()
+        );
+        assert_eq!(harness.api.pending_len(), 0);
+        assert_eq!(harness.failures.snapshot().service_rejected, 1);
     }
 
     #[test]
