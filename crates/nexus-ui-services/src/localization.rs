@@ -296,6 +296,16 @@ impl LocalizationService {
         }
     }
 
+    /// Removes one owner's overrides after every earlier queued command.
+    ///
+    /// The caller must close and drain the exact owner's callback gate before
+    /// invoking this barrier. A full command queue rejects cleanup without
+    /// applying any queued work, so the operation can be retried explicitly.
+    pub fn cleanup_owner(&mut self, owner: OwnerId) -> Result<AdvanceReport, LocalizationError> {
+        self.handle().cleanup_owner(owner)?;
+        Ok(self.advance())
+    }
+
     /// Replaces base locale data while preserving returned pointer stability and
     /// owner-scoped runtime overrides.
     pub fn reload(
@@ -559,7 +569,9 @@ fn validate_c_string(value: &str) -> Result<(), LocalizationError> {
 mod tests {
     use std::ffi::{CStr, CString};
 
-    use super::{LocaleAsset, LocaleSource, LocaleSourceError, LocalizationService};
+    use super::{
+        LocaleAsset, LocaleSource, LocaleSourceError, LocalizationError, LocalizationService,
+    };
     use crate::OwnerId;
 
     struct MemorySource(Vec<LocaleAsset>);
@@ -638,6 +650,60 @@ mod tests {
         assert!(handle.cleanup_owner(OwnerId::new(7, 1)).is_ok());
         assert_eq!(service.advance().removed_overrides, 1);
         assert_eq!(service.translate(&hello, None).to_bytes(), b"Hello patched");
+    }
+
+    #[test]
+    fn synchronous_cleanup_is_fifo_and_generation_exact() {
+        let mut service = LocalizationService::new("en", 8)
+            .unwrap_or_else(|error| panic!("service failed: {error}"));
+        service
+            .reload(&mut fixture_source())
+            .unwrap_or_else(|error| panic!("reload failed: {error}"));
+        let first = OwnerId::new(7, 1);
+        let reloaded = OwnerId::new(7, 2);
+        let handle = service.handle();
+        assert!(handle.set(first, "hello", "en", "First").is_ok());
+        assert!(handle.set(reloaded, "hello", "en", "Reloaded").is_ok());
+
+        let report = service
+            .cleanup_owner(first)
+            .unwrap_or_else(|error| panic!("cleanup failed: {error}"));
+        assert_eq!(report.applied_texts, 2);
+        assert_eq!(report.removed_overrides, 1);
+        assert_eq!(
+            service.translate(&c_string("hello"), None).to_bytes(),
+            b"Reloaded"
+        );
+    }
+
+    #[test]
+    fn full_queue_rejects_synchronous_cleanup_without_claiming_completion() {
+        let mut service = LocalizationService::new("en", 1)
+            .unwrap_or_else(|error| panic!("service failed: {error}"));
+        service
+            .reload(&mut fixture_source())
+            .unwrap_or_else(|error| panic!("reload failed: {error}"));
+        let owner = OwnerId::new(7, 1);
+        assert!(
+            service
+                .handle()
+                .set(owner, "hello", "en", "Runtime")
+                .is_ok()
+        );
+
+        assert_eq!(
+            service.cleanup_owner(owner),
+            Err(LocalizationError::QueueFull)
+        );
+        assert_eq!(service.advance().applied_texts, 1);
+        let retry = service
+            .cleanup_owner(owner)
+            .unwrap_or_else(|error| panic!("cleanup retry failed: {error}"));
+        assert_eq!(retry.removed_overrides, 1);
+        assert_eq!(
+            service.translate(&c_string("hello"), None).to_bytes(),
+            b"Hello patched"
+        );
     }
 
     #[test]

@@ -30,8 +30,8 @@ use nexus_ui_host::{
     UiHost,
 };
 use nexus_ui_services::{
-    DirectoryLocaleSource, LocalizationService, ScalingService, ScalingSink, ScalingSinkError,
-    ScalingSnapshot, UiScale,
+    DirectoryLocaleSource, LocalizationAdvanceReport, LocalizationError, LocalizationService,
+    OwnerId, ScalingService, ScalingSink, ScalingSinkError, ScalingSnapshot, UiScale,
 };
 use thiserror::Error;
 use windows_sys::Win32::Foundation::HMODULE;
@@ -66,7 +66,7 @@ struct RuntimeServices {
     fonts: Arc<crate::fonts::RuntimeFontCoordinator>,
     textures: Arc<crate::textures::RuntimeTextureCoordinator>,
     render_observer: Arc<dyn RenderSessionObserver>,
-    localization: Option<RuntimeLocalization>,
+    localization: Arc<RuntimeLocalization>,
     scaling: RuntimeScaling,
     logger: LogRegistry,
     scheduler: Option<MinimalScheduler>,
@@ -146,7 +146,10 @@ impl RuntimeServices {
         if let Some(error) = input_error {
             crate::diagnostics::report_proxy_failure(&error);
         }
-        let localization = RuntimeLocalization::load(&paths, settings.as_ref());
+        let localization = Arc::new(
+            RuntimeLocalization::load(&paths, settings.as_ref())
+                .map_err(ServiceInitError::Localization)?,
+        );
         let scaling = RuntimeScaling::load(Arc::clone(&settings));
 
         Ok(Self {
@@ -196,11 +199,12 @@ impl RuntimeServices {
 }
 
 struct RuntimeLocalizationState {
-    service: LocalizationService,
     texts: Arc<[CString]>,
+    pending_changed: bool,
 }
 
-struct RuntimeLocalization {
+pub(crate) struct RuntimeLocalization {
+    service: Arc<Mutex<LocalizationService>>,
     state: Mutex<RuntimeLocalizationState>,
 }
 
@@ -220,7 +224,18 @@ impl Default for LocalizationFrame {
 }
 
 impl RuntimeLocalization {
-    fn load(paths: &PathIndex, settings: &SettingsStore) -> Option<Self> {
+    fn new(service: LocalizationService) -> Self {
+        let texts = localization_texts(&service);
+        Self {
+            service: Arc::new(Mutex::new(service)),
+            state: Mutex::new(RuntimeLocalizationState {
+                texts,
+                pending_changed: false,
+            }),
+        }
+    }
+
+    fn load(paths: &PathIndex, settings: &SettingsStore) -> Result<Self, LocalizationError> {
         let language = match settings.get::<String>(LANGUAGE_SETTING) {
             Ok(Some(language)) if !language.is_empty() => language,
             Ok(_) => "en".to_owned(),
@@ -233,31 +248,56 @@ impl RuntimeLocalization {
             Ok(service) => service,
             Err(error) => {
                 crate::diagnostics::report_proxy_failure(&error);
-                LocalizationService::new("en", LOCALIZATION_QUEUE_CAPACITY).ok()?
+                LocalizationService::new("en", LOCALIZATION_QUEUE_CAPACITY)?
             }
         };
         let mut source = DirectoryLocaleSource::new(paths.get(PathKey::LocalesDirectory));
         if let Err(error) = service.reload(&mut source) {
             crate::diagnostics::report_proxy_failure(&error);
         }
-        let texts = localization_texts(&service);
-        Some(Self {
-            state: Mutex::new(RuntimeLocalizationState { service, texts }),
-        })
+        Ok(Self::new(service))
+    }
+
+    /// Clones the shared service used by the native localization adapter.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn backend_service(&self) -> Arc<Mutex<LocalizationService>> {
+        Arc::clone(&self.service)
+    }
+
+    /// Removes one exact owner's overrides and refreshes the glyph snapshot.
+    #[allow(dead_code)]
+    pub(crate) fn cleanup_owner(&self, owner: OwnerId) -> Result<usize, LocalizationError> {
+        let mut service = mutex_lock(&self.service);
+        let report = service.cleanup_owner(owner)?;
+        let removed = report.removed_overrides;
+        let mut state = mutex_lock(&self.state);
+        apply_localization_report(&service, &mut state, report);
+        Ok(removed)
     }
 
     fn advance(&self) -> LocalizationFrame {
+        let mut service = mutex_lock(&self.service);
+        let report = service.advance();
         let mut state = mutex_lock(&self.state);
-        let report = state.service.advance();
-        let changed =
-            report.applied_texts > 0 || report.removed_overrides > 0 || report.language_changed;
-        if changed {
-            state.texts = localization_texts(&state.service);
-        }
+        apply_localization_report(&service, &mut state, report);
         LocalizationFrame {
-            changed,
+            changed: std::mem::take(&mut state.pending_changed),
             texts: Arc::clone(&state.texts),
         }
+    }
+}
+
+fn apply_localization_report(
+    service: &LocalizationService,
+    state: &mut RuntimeLocalizationState,
+    report: LocalizationAdvanceReport,
+) {
+    let changed =
+        report.applied_texts > 0 || report.removed_overrides > 0 || report.language_changed;
+    if changed {
+        state.texts = localization_texts(service);
+        state.pending_changed = true;
     }
 }
 
@@ -284,6 +324,8 @@ enum ServiceInitError {
     PreparePaths(#[source] PathError),
     #[error("runtime directory creation failed")]
     CreateDirectories(#[source] PathError),
+    #[error("runtime localization initialization failed")]
+    Localization(#[source] LocalizationError),
     #[error("the Mumble shared-memory name is unavailable")]
     MumbleName,
 }
@@ -559,8 +601,9 @@ pub(crate) fn advance_localization() -> LocalizationFrame {
     SERVICES
         .get()
         .and_then(Option::as_ref)
-        .and_then(|services| services.localization.as_ref())
-        .map_or_else(LocalizationFrame::default, RuntimeLocalization::advance)
+        .map_or_else(LocalizationFrame::default, |services| {
+            services.localization.advance()
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -731,11 +774,40 @@ mod tests {
         ContextMenuItemSnapshot, OwnerGeneration, QuickAccessPosition, QuickAccessSettings,
         QuickAccessSnapshot, ShortcutSnapshot,
     };
+    use nexus_ui_services::{
+        LocaleAsset, LocaleSource, LocaleSourceError, LocalizationService, OwnerId,
+    };
 
     use super::{
-        NexusLinkQuickAccessPosition, nexus_link_quick_access_position, quick_access_link_state,
-        ui_host,
+        LocalizationFrame, NexusLinkQuickAccessPosition, RuntimeLocalization, mutex_lock,
+        nexus_link_quick_access_position, quick_access_link_state, ui_host,
     };
+
+    struct MemoryLocaleSource;
+
+    impl LocaleSource for MemoryLocaleSource {
+        fn load(&mut self) -> Result<Vec<LocaleAsset>, LocaleSourceError> {
+            Ok(vec![LocaleAsset::new(
+                br#"{"Identifier":"en","Texts":{"hello":"Hello"}}"#.as_slice(),
+            )])
+        }
+    }
+
+    fn runtime_localization() -> RuntimeLocalization {
+        let mut service = LocalizationService::new("en", 8)
+            .unwrap_or_else(|error| panic!("localization service failed: {error}"));
+        service
+            .reload(&mut MemoryLocaleSource)
+            .unwrap_or_else(|error| panic!("localization reload failed: {error}"));
+        RuntimeLocalization::new(service)
+    }
+
+    fn frame_has_text(frame: &LocalizationFrame, expected: &[u8]) -> bool {
+        frame
+            .texts
+            .iter()
+            .any(|text| text.as_c_str().to_bytes() == expected)
+    }
 
     fn shortcut(identifier: &str, input_bind: &str) -> ShortcutSnapshot {
         ShortcutSnapshot {
@@ -799,5 +871,38 @@ mod tests {
         let first = ui_host();
         let second = ui_host();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn backend_localization_writes_flow_through_normal_frame_advance() {
+        let localization = runtime_localization();
+        let service = localization.backend_service();
+        let handle = mutex_lock(&service).handle();
+        assert!(
+            handle
+                .set(OwnerId::new(7, 1), "hello", "en", "Runtime")
+                .is_ok()
+        );
+
+        let frame = localization.advance();
+        assert!(frame.changed);
+        assert!(frame_has_text(&frame, b"Runtime"));
+        assert!(!localization.advance().changed);
+    }
+
+    #[test]
+    fn synchronous_localization_cleanup_latches_one_glyph_refresh_frame() {
+        let localization = runtime_localization();
+        let owner = OwnerId::new(7, 1);
+        let service = localization.backend_service();
+        let handle = mutex_lock(&service).handle();
+        assert!(handle.set(owner, "hello", "en", "Runtime").is_ok());
+        assert!(localization.advance().changed);
+
+        assert_eq!(localization.cleanup_owner(owner), Ok(1));
+        let cleanup_frame = localization.advance();
+        assert!(cleanup_frame.changed);
+        assert!(frame_has_text(&cleanup_frame, b"Hello"));
+        assert!(!localization.advance().changed);
     }
 }
