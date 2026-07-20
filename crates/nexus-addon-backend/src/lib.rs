@@ -40,7 +40,10 @@ pub use services::{
     FontBackend, GameBindBackend, InputBindBackend, LocalizationBackend, RequiredServiceResult,
     TextureBackend, UpdateBackend, WndProcBackend,
 };
-pub use textures::TextureApi;
+pub use textures::{
+    TextureApi, TextureFacadeError, TextureServiceFacade, TextureSourceFactory,
+    TextureSourceFailurePolicy,
+};
 pub use ui::UiApi;
 pub use updates::{AddonUpdateRequest, DEFAULT_UPDATE_QUEUE_CAPACITY, UpdateApi};
 pub use wnd_proc::WndProcApi;

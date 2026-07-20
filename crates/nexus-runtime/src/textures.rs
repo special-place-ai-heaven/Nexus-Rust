@@ -7,6 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use nexus_addon_backend::{
+    TextureFacadeError, TextureServiceFacade, TextureSourceFactory, TextureSourceFailurePolicy,
+};
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
 use nexus_dxgi::RenderCallbackError;
 use nexus_network::{BaseUrl, CachePolicy, ClientError, HttpClient, HttpClientConfig, SystemClock};
@@ -305,6 +308,46 @@ impl RuntimeTextureCoordinator {
             }
         };
         retire_session(active);
+    }
+}
+
+impl TextureServiceFacade for RuntimeTextureCoordinator {
+    fn get(&self, identifier: &str) -> Result<Option<TextureHandle>, TextureFacadeError> {
+        let operation = self
+            .acquire()
+            .map_err(|_error| TextureFacadeError::Rejected)?;
+        TextureServiceFacade::get(&operation.session.service, identifier)
+    }
+
+    fn load_with_source(
+        &self,
+        identifier: &str,
+        options: LoadOptions,
+        callback: Option<TextureCallback>,
+        source: TextureSourceFactory<'_>,
+        failure_policy: TextureSourceFailurePolicy,
+    ) -> Result<RequestOutcome, TextureFacadeError> {
+        let operation = self
+            .acquire()
+            .map_err(|_error| TextureFacadeError::Rejected)?;
+        TextureServiceFacade::load_with_source(
+            &operation.session.service,
+            identifier,
+            options,
+            callback,
+            source,
+            failure_policy,
+        )
+    }
+
+    fn cleanup_owner_generation(
+        &self,
+        owner: OwnerGeneration,
+    ) -> Result<usize, TextureFacadeError> {
+        let operation = self
+            .acquire()
+            .map_err(|_error| TextureFacadeError::Rejected)?;
+        TextureServiceFacade::cleanup_owner_generation(&operation.session.service, owner)
     }
 }
 
@@ -616,27 +659,55 @@ mod tests {
             }),
             Err(RuntimeTextureError::Unavailable)
         ));
+        let source_calls = AtomicUsize::new(0);
+        assert!(matches!(
+            TextureServiceFacade::load_with_source(
+                coordinator.as_ref(),
+                "unavailable",
+                LoadOptions {
+                    owner: nexus_textures::RequestOwner::Host,
+                    shadow_existing: false,
+                },
+                None,
+                Box::new(|| {
+                    source_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(TextureSource::Memory(vec![1]))
+                }),
+                TextureSourceFailurePolicy::Suppress,
+            ),
+            Err(TextureFacadeError::Rejected)
+        ));
+        assert_eq!(source_calls.load(Ordering::SeqCst), 0);
 
         drop(lease);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn reentrant_shutdown_defers_drop_until_the_current_operation_exits() {
+    fn facade_submission_holds_the_session_guard_through_lazy_source_acquisition() {
         let coordinator = Arc::new(RuntimeTextureCoordinator::default());
         let drops = Arc::new(AtomicUsize::new(0));
         let lease = coordinator
             .attach_service(identity(6, 2), service(&drops))
             .expect("test service should attach");
-        let operation = coordinator
-            .acquire()
-            .expect("attached operation should acquire");
-
-        coordinator.shutdown();
-        assert_eq!(coordinator.active_identity(), None);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-
-        drop(operation);
+        let outcome = TextureServiceFacade::load_with_source(
+            coordinator.as_ref(),
+            "reentrant-retirement",
+            LoadOptions {
+                owner: nexus_textures::RequestOwner::Host,
+                shadow_existing: false,
+            },
+            None,
+            Box::new(|| {
+                coordinator.shutdown();
+                assert_eq!(coordinator.active_identity(), None);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                Ok(TextureSource::Memory(vec![1]))
+            }),
+            TextureSourceFailurePolicy::Suppress,
+        )
+        .expect("an admitted facade operation should finish against its selected service");
+        assert!(matches!(outcome, RequestOutcome::Queued));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         drop(lease);
         assert_eq!(drops.load(Ordering::SeqCst), 1);

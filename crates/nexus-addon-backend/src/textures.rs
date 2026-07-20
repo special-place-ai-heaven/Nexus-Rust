@@ -8,8 +8,8 @@ use std::sync::Arc;
 use nexus_abi::{ReceiveTexture, Texture};
 use nexus_core::OwnerToken;
 use nexus_textures::{
-    DownloadTarget, LoadOptions, ModuleHandle, RequestOutcome, RequestOwner, TextureCallback,
-    TextureHandle, TextureService, TextureSource,
+    DownloadTarget, LoadOptions, ModuleHandle, OwnerGeneration, RequestOutcome, RequestOwner,
+    TextureCallback, TextureHandle, TextureService, TextureSource,
 };
 
 use crate::{
@@ -17,20 +17,103 @@ use crate::{
     TextureBackend,
 };
 
-/// Caller-attributed adapter from the legacy texture ABI to [`TextureService`].
+/// Lazily acquires one owned texture source during a facade submission.
+pub type TextureSourceFactory<'a> = Box<dyn FnOnce() -> RequiredServiceResult<TextureSource> + 'a>;
+
+/// Closed result from a process texture facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureFacadeError {
+    /// The caller-provided lazy source factory rejected the request.
+    Source(BackendOperationError),
+    /// The active texture service or its lifecycle gate rejected the request.
+    Rejected,
+}
+
+/// Controls legacy callback publication for synchronous source failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureSourceFailurePolicy {
+    /// Do not publish failures produced by the lazy source factory.
+    Suppress,
+    /// Publish a null texture only for a typed service rejection.
+    NotifyServiceRejected,
+}
+
+/// Process-safe access to the texture service selected for the active render session.
+///
+/// Implementations must keep the selected service alive for the complete method
+/// call. The source factory is deliberately borrowed and non-`Send`: it runs
+/// synchronously only after cache, pending, and override resolution require it.
+pub trait TextureServiceFacade: Send + Sync + 'static {
+    /// Gets one existing stable texture descriptor.
+    fn get(&self, identifier: &str) -> Result<Option<TextureHandle>, TextureFacadeError>;
+
+    /// Submits one lazy texture request against the active service.
+    fn load_with_source(
+        &self,
+        identifier: &str,
+        options: LoadOptions,
+        callback: Option<TextureCallback>,
+        source: TextureSourceFactory<'_>,
+        failure_policy: TextureSourceFailurePolicy,
+    ) -> Result<RequestOutcome, TextureFacadeError>;
+
+    /// Removes callbacks and pending ownership for one exact add-on generation.
+    fn cleanup_owner_generation(&self, owner: OwnerGeneration)
+    -> Result<usize, TextureFacadeError>;
+}
+
+impl TextureServiceFacade for TextureService {
+    fn get(&self, identifier: &str) -> Result<Option<TextureHandle>, TextureFacadeError> {
+        Ok(TextureService::get(self, identifier))
+    }
+
+    fn load_with_source(
+        &self,
+        identifier: &str,
+        options: LoadOptions,
+        callback: Option<TextureCallback>,
+        source: TextureSourceFactory<'_>,
+        failure_policy: TextureSourceFailurePolicy,
+    ) -> Result<RequestOutcome, TextureFacadeError> {
+        TextureService::load_with_source(
+            self,
+            identifier,
+            options,
+            callback,
+            move || source().map_err(TextureFacadeError::Source),
+            move |error| {
+                failure_policy == TextureSourceFailurePolicy::NotifyServiceRejected
+                    && matches!(
+                        error,
+                        TextureFacadeError::Source(BackendOperationError::ServiceRejected)
+                    )
+            },
+            |_error| TextureFacadeError::Rejected,
+        )
+    }
+
+    fn cleanup_owner_generation(
+        &self,
+        owner: OwnerGeneration,
+    ) -> Result<usize, TextureFacadeError> {
+        Ok(TextureService::cleanup_owner_generation(self, owner))
+    }
+}
+
+/// Caller-attributed adapter from the legacy texture ABI to a render-session facade.
 ///
 /// Native strings and memory are copied before submission. The service owns
 /// stable ABI descriptors, bounded worker queues, and render-thread callback
 /// delivery; this adapter owns native caller attribution and callback gating.
 pub struct TextureApi {
     boundary: Arc<NativeCallBoundary>,
-    service: Arc<TextureService>,
+    service: Arc<dyn TextureServiceFacade>,
 }
 
 impl TextureApi {
     /// Creates a texture adapter around the process texture service.
     #[must_use]
-    pub fn new(boundary: Arc<NativeCallBoundary>, service: Arc<TextureService>) -> Self {
+    pub fn new(boundary: Arc<NativeCallBoundary>, service: Arc<dyn TextureServiceFacade>) -> Self {
         Self { boundary, service }
     }
 
@@ -38,10 +121,11 @@ impl TextureApi {
     pub fn get(&self, identifier: *const c_char) -> RequiredServiceResult<*mut Texture> {
         let _owner = self.boundary.resolve_owner(None)?;
         let identifier = self.boundary.snapshot_identifier(identifier)?;
-        Ok(self
+        let texture = self
             .service
             .get(identifier.as_str())
-            .map_or(ptr::null_mut(), |texture| texture.as_abi_ptr()))
+            .map_err(|error| self.facade_error(error))?;
+        Ok(texture.map_or(ptr::null_mut(), |texture| texture.as_abi_ptr()))
     }
 
     /// Gets or asynchronously creates a texture from a copied filesystem path.
@@ -170,14 +254,16 @@ impl TextureApi {
         identifier: &NativeText,
         source: impl FnOnce() -> RequiredServiceResult<TextureSource>,
     ) -> RequiredServiceResult<*mut Texture> {
-        let outcome = self.service.load_with_source(
-            identifier.as_str(),
-            load_options(owner, false),
-            None,
-            source,
-            |_error| false,
-            |_error| self.service_rejected(),
-        )?;
+        let outcome = self
+            .service
+            .load_with_source(
+                identifier.as_str(),
+                load_options(owner, false),
+                None,
+                Box::new(source),
+                TextureSourceFailurePolicy::Suppress,
+            )
+            .map_err(|error| self.facade_error(error))?;
         self.finish_submission(owner)?;
         Ok(outcome_pointer(outcome))
     }
@@ -187,7 +273,11 @@ impl TextureApi {
         owner: OwnerToken,
         identifier: &NativeText,
     ) -> RequiredServiceResult<Option<*mut Texture>> {
-        let Some(texture) = self.service.get(identifier.as_str()) else {
+        let Some(texture) = self
+            .service
+            .get(identifier.as_str())
+            .map_err(|error| self.facade_error(error))?
+        else {
             return Ok(None);
         };
         self.finish_submission(owner)?;
@@ -201,14 +291,16 @@ impl TextureApi {
         callback: Option<TextureCallback>,
         source: impl FnOnce() -> RequiredServiceResult<TextureSource>,
     ) -> RequiredServiceResult<()> {
-        let _outcome = self.service.load_with_source(
-            identifier.as_str(),
-            load_options(owner, true),
-            callback,
-            source,
-            |error| matches!(error, BackendOperationError::ServiceRejected),
-            |_error| self.service_rejected(),
-        )?;
+        let _outcome = self
+            .service
+            .load_with_source(
+                identifier.as_str(),
+                load_options(owner, true),
+                callback,
+                Box::new(source),
+                TextureSourceFailurePolicy::NotifyServiceRejected,
+            )
+            .map_err(|error| self.facade_error(error))?;
         self.finish_submission(owner)
     }
 
@@ -297,7 +389,7 @@ impl TextureApi {
 
     fn finish_submission(&self, owner: OwnerToken) -> RequiredServiceResult<()> {
         if let Err(error) = self.boundary.validate_current_owner(owner) {
-            let _removed = self
+            let _cleanup = self
                 .service
                 .cleanup_owner_generation(nexus_textures::OwnerGeneration::from(owner));
             return Err(error.into());
@@ -310,6 +402,13 @@ impl TextureApi {
             .failures()
             .record(BackendFailure::ServiceRejected);
         BackendOperationError::ServiceRejected
+    }
+
+    fn facade_error(&self, error: TextureFacadeError) -> BackendOperationError {
+        match error {
+            TextureFacadeError::Source(error) => error,
+            TextureFacadeError::Rejected => self.service_rejected(),
+        }
     }
 }
 
@@ -671,7 +770,7 @@ mod tests {
                 )
                 .expect("test texture service should start"),
             );
-            let api = TextureApi::new(boundary, Arc::clone(&service));
+            let api = TextureApi::new(boundary, service.clone());
             Self {
                 api,
                 service,
