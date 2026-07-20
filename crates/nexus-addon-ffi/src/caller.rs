@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use nexus_core::{AddressOwnershipIndex, OwnerToken};
+use nexus_core::{AddressOwnershipIndex, CallbackGate, OwnerToken};
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -35,6 +35,14 @@ pub trait AddressOwnerResolver: Send + Sync + 'static {
     /// This check is required for address results and explicit owner scopes so
     /// a stale generation always fails closed.
     fn is_current_owner(&self, owner: OwnerToken) -> bool;
+
+    /// Clones the host-owned callback gate for one exact current generation.
+    ///
+    /// Resolvers that cannot prove the gate comes from their own ownership
+    /// authority must fail closed with `None`.
+    fn callback_gate_for_current(&self, _owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+        None
+    }
 }
 
 impl AddressOwnerResolver for AddressOwnershipIndex {
@@ -44,6 +52,10 @@ impl AddressOwnerResolver for AddressOwnershipIndex {
 
     fn is_current_owner(&self, owner: OwnerToken) -> bool {
         self.is_current_owner(owner)
+    }
+
+    fn callback_gate_for_current(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+        AddressOwnershipIndex::callback_gate_for_current(self, owner)
     }
 }
 
@@ -160,6 +172,20 @@ impl AddonCallerResolver {
     #[must_use]
     pub fn is_current_owner(&self, owner: OwnerToken) -> bool {
         contain_panic(|| matches!(self.owner_is_current(owner), Ok(true))).unwrap_or(false)
+    }
+
+    /// Clones the callback gate from the same authority used for attribution.
+    ///
+    /// Missing gates and resolver panics fail closed.
+    #[must_use]
+    pub fn callback_gate_for_current(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+        contain_panic(|| {
+            self.address_owners
+                .is_current_owner(owner)
+                .then(|| self.address_owners.callback_gate_for_current(owner))
+                .flatten()
+        })
+        .unwrap_or_default()
     }
 
     fn resolve_registered_address_inner(&self, address: NonZeroUsize) -> Option<OwnerToken> {
@@ -594,15 +620,21 @@ mod tests {
         let index = Arc::new(AddressOwnershipIndex::new());
         let owner = owner(71, 3);
         let hint = address(0x7_1000);
+        let gate = Arc::new(CallbackGate::open());
         index
-            .publish(owner, hint, 0x1000, Arc::new(CallbackGate::open()))
+            .publish(owner, hint, 0x1000, Arc::clone(&gate))
             .expect("fixture range should publish");
         let resolver = AddonCallerResolver::new(index.clone());
 
         assert_eq!(resolver.resolve(Some(hint)), Some(owner));
+        let resolved_gate = resolver
+            .callback_gate_for_current(owner)
+            .expect("current owner should expose its exact callback gate");
+        assert!(Arc::ptr_eq(&resolved_gate, &gate));
         assert!(index.close(owner));
         assert_eq!(index.owner_for_address(hint), Some(owner));
         assert_eq!(resolver.resolve(Some(hint)), None);
+        assert!(resolver.callback_gate_for_current(owner).is_none());
     }
 
     #[test]

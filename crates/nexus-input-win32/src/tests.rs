@@ -4,8 +4,9 @@ use crate::encoding::{
 };
 use crate::{Win32GameInput, WindowAttachError};
 use nexus_input::{
-    GameBindId, GameBindRegistry, GameInvoker, GameMessage, GameMessageSink, GameSinkError,
-    GameSlot, InputBind, InputDevice, Modifier, ModifierState, MouseButton, PhysicalInputState,
+    GameBindId, GameBindRegistry, GameInvoker, GameMessage, GameMessageSink, GameOnlyMessageSink,
+    GameSinkError, GameSlot, InputBind, InputDevice, Modifier, ModifierState, MouseButton,
+    PhysicalInputState,
 };
 use std::collections::BTreeMap;
 use std::mem;
@@ -320,7 +321,10 @@ fn async_key_poll_ignores_the_legacy_low_order_ambiguity() {
 
 #[test]
 fn adapter_traits_and_debug_output_are_address_free() {
-    fn assert_traits<T: GameMessageSink + PhysicalInputState + Send + Sync>() {}
+    fn assert_traits<
+        T: GameMessageSink + GameOnlyMessageSink + PhysicalInputState + Send + Sync,
+    >() {
+    }
     assert_traits::<Win32GameInput>();
 
     let adapter = Arc::new(Win32GameInput::new());
@@ -329,6 +333,40 @@ fn adapter_traits_and_debug_output_are_address_free() {
         Err(WindowAttachError::InvalidWindow) => {}
         Ok(_) | Err(_) => panic!("a null HWND must be rejected"),
     }
+}
+
+#[test]
+fn game_only_messages_use_the_attached_window_and_legacy_wire_translation() {
+    let window = HiddenWindow::create();
+    let adapter = Arc::new(Win32GameInput::new());
+    let _lease = adapter
+        .attach(window.hwnd())
+        .unwrap_or_else(|_| panic!("hidden window attachment failed"));
+
+    adapter
+        .send_to_game_only(17, 0x1234, -7)
+        .expect("low message should post");
+    assert_eq!(
+        window.receive(),
+        RecordedMessage {
+            message: PASSTHROUGH_FIRST + 17,
+            wparam: 0x1234,
+            lparam: -7,
+        }
+    );
+
+    let high_message = PASSTHROUGH_FIRST + WM_USER - 1;
+    adapter
+        .send_to_game_only(high_message, 0x5678, -9)
+        .expect("high message should post unchanged");
+    assert_eq!(
+        window.receive(),
+        RecordedMessage {
+            message: high_message,
+            wparam: 0x5678,
+            lparam: -9,
+        }
+    );
 }
 
 #[test]

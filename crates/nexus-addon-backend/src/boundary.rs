@@ -4,7 +4,7 @@ use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use nexus_addon_ffi::AddonCallerResolver;
-use nexus_core::OwnerToken;
+use nexus_core::{CallbackGate, OwnerToken};
 use nexus_native_memory::{
     NativeMemoryReader, OwnedNativeBytes, OwnedNativeString, snapshot_u8, write_u8, write_usize,
 };
@@ -213,6 +213,19 @@ impl NativeCallBoundary {
         Err(CallBoundaryError::CallerAttribution)
     }
 
+    /// Clones the exact callback gate from this boundary's attribution authority.
+    pub fn callback_gate_for_current(
+        &self,
+        owner: OwnerToken,
+    ) -> Result<Arc<CallbackGate>, CallBoundaryError> {
+        self.callers
+            .callback_gate_for_current(owner)
+            .ok_or_else(|| {
+                self.failures.record(BackendFailure::CallerAttribution);
+                CallBoundaryError::CallerAttribution
+            })
+    }
+
     /// Copies and validates an identifier before it reaches a service.
     pub fn snapshot_identifier(
         &self,
@@ -330,7 +343,7 @@ mod tests {
     use std::sync::Arc;
 
     use nexus_addon_ffi::{AddonCallerResolver, AddressOwnerResolver};
-    use nexus_core::OwnerToken;
+    use nexus_core::{CallbackGate, OwnerToken};
     use nexus_native_memory::NativeMemoryReader;
 
     use super::{CallBoundaryError, NativeCallBoundary, NativeText};
@@ -365,6 +378,24 @@ mod tests {
         }
     }
 
+    struct GatedOwner {
+        gate: Arc<CallbackGate>,
+    }
+
+    impl AddressOwnerResolver for GatedOwner {
+        fn owner_for_address(&self, _address: NonZeroUsize) -> Option<OwnerToken> {
+            Some(OWNER)
+        }
+
+        fn is_current_owner(&self, owner: OwnerToken) -> bool {
+            owner == OWNER
+        }
+
+        fn callback_gate_for_current(&self, owner: OwnerToken) -> Option<Arc<CallbackGate>> {
+            (owner == OWNER).then(|| Arc::clone(&self.gate))
+        }
+    }
+
     fn boundary_with_callers(
         owner: Option<OwnerToken>,
     ) -> (NativeCallBoundary, Arc<AddonCallerResolver>) {
@@ -395,6 +426,31 @@ mod tests {
             missing.resolve_owner(Some(hint)),
             Err(CallBoundaryError::CallerAttribution)
         );
+        assert_eq!(missing.failures().snapshot().caller_attribution, 1);
+    }
+
+    #[test]
+    fn callback_gate_comes_from_the_attribution_authority_and_fails_closed() {
+        let gate = Arc::new(CallbackGate::open());
+        let callers = Arc::new(AddonCallerResolver::new(Arc::new(GatedOwner {
+            gate: Arc::clone(&gate),
+        })));
+        let present = NativeCallBoundary::new(
+            callers,
+            NativeMemoryReader::default(),
+            Arc::new(BackendFailures::new()),
+        );
+
+        let resolved = present
+            .callback_gate_for_current(OWNER)
+            .expect("current owner should expose its callback gate");
+        assert!(Arc::ptr_eq(&resolved, &gate));
+
+        let missing = boundary(Some(OWNER));
+        assert!(matches!(
+            missing.callback_gate_for_current(OWNER),
+            Err(CallBoundaryError::CallerAttribution)
+        ));
         assert_eq!(missing.failures().snapshot().caller_attribution, 1);
     }
 

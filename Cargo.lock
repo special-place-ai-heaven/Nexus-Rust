@@ -316,6 +316,7 @@ dependencies = [
  "nexus-core",
  "nexus-data-services",
  "nexus-inline-hooks",
+ "nexus-input",
  "nexus-native-memory",
  "nexus-platform",
  "nexus-ui-host",

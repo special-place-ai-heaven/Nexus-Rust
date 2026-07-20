@@ -2,7 +2,10 @@ use crate::encoding::{
     async_key_is_down, key_lparam, key_message_id, modifier_virtual_key, mouse_message_id,
     mouse_wparam, point_lparam, wire_message_id,
 };
-use nexus_input::{GameMessage, GameMessageSink, GameSinkError, ModifierState, PhysicalInputState};
+use nexus_input::{
+    GameMessage, GameMessageSink, GameOnlyMessageSink, GameSinkError, ModifierState,
+    PhysicalInputState,
+};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -156,6 +159,36 @@ impl GameMessageSink for Win32GameInput {
                 }
                 return Err(GameSinkError);
             }
+        }
+        Ok(())
+    }
+}
+
+impl GameOnlyMessageSink for Win32GameInput {
+    fn send_to_game_only(
+        &self,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> Result<(), GameSinkError> {
+        let mut state = self.lock_state();
+        let active = state.active.ok_or(GameSinkError)?;
+        let hwnd = active.hwnd.get() as HWND;
+        if !is_window(hwnd) {
+            state.active = None;
+            return Err(GameSinkError);
+        }
+
+        let posted = unsafe {
+            // SAFETY: hwnd was validated above and PostMessageW copies this
+            // scalar tuple before returning. It invokes no callback.
+            PostMessageW(hwnd, wire_message_id(message), w_param, l_param)
+        };
+        if posted == FALSE {
+            if !is_window(hwnd) {
+                state.active = None;
+            }
+            return Err(GameSinkError);
         }
         Ok(())
     }

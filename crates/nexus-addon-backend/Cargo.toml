@@ -13,6 +13,7 @@ nexus-addon-ffi.workspace = true
 nexus-core.workspace = true
 nexus-data-services.workspace = true
 nexus-inline-hooks.workspace = true
+nexus-input.workspace = true
 nexus-native-memory.workspace = true
 nexus-platform.workspace = true
 nexus-ui-host.workspace = true

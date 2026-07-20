@@ -358,6 +358,17 @@ pub trait GameMessageSink: Send + Sync + 'static {
     fn send_batch(&self, messages: &[GameMessage]) -> Result<(), GameSinkError>;
 }
 
+/// Platform-owned delivery boundary for one opaque game-window message.
+pub trait GameOnlyMessageSink: Send + Sync + 'static {
+    /// Delivers one scalar tuple to the currently attached game window.
+    fn send_to_game_only(
+        &self,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+    ) -> Result<(), GameSinkError>;
+}
+
 /// Logical state reached by a game invocation operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvokeState {
