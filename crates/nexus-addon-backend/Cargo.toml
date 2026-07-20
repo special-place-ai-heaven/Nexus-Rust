@@ -14,9 +14,12 @@ nexus-core.workspace = true
 nexus-data-services.workspace = true
 nexus-inline-hooks.workspace = true
 nexus-input.workspace = true
+nexus-imgui-compat.workspace = true
 nexus-native-memory.workspace = true
 nexus-platform.workspace = true
+nexus-textures.workspace = true
 nexus-ui-host.workspace = true
+nexus-ui-services.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -251,6 +251,7 @@ pub struct ServiceStats {
 }
 
 struct CallbackRegistration {
+    id: u64,
     owner: RequestOwner,
     callback: TextureCallback,
 }
@@ -264,6 +265,7 @@ struct PendingRequest {
 #[derive(Default)]
 struct RegistryState {
     next_request_id: u64,
+    next_callback_id: u64,
     registry: HashMap<Arc<str>, TextureHandle>,
     pending: HashMap<Arc<str>, PendingRequest>,
 }
@@ -334,6 +336,7 @@ impl TextureService {
             config,
             state: Mutex::new(RegistryState {
                 next_request_id: 1,
+                next_callback_id: 1,
                 ..RegistryState::default()
             }),
             decoder,
@@ -412,12 +415,16 @@ impl TextureService {
         }
 
         let identifier: Arc<str> = Arc::from(identifier);
-        let reserved = self.reserve_request(&identifier, options, callback)?;
-        let Reservation::New { request_id } = reserved else {
+        let reserved = self.reserve_request(&identifier, options, callback, true)?;
+        let Reservation::New { request_id, .. } = reserved else {
             return self.finish_existing_reservation(reserved);
         };
 
-        let source = match self.resolve_source(&identifier, source) {
+        let source = match self
+            .resolve_override(&identifier)
+            .and_then(|override_source| {
+                override_source.map_or_else(|| self.resolve_source(source), Ok)
+            }) {
             Ok(source) => source,
             Err(error) => {
                 self.fail_reserved(&identifier, request_id, error);
@@ -425,30 +432,91 @@ impl TextureService {
             }
         };
 
-        let queued = match source {
-            ResolvedSource::Decode(source) => self
-                .shared
-                .work
-                .try_push(DecodeJob {
-                    identifier: Arc::clone(&identifier),
-                    request_id,
-                    source,
-                })
-                .map_err(|_| TextureError::QueueFull(QueueKind::Work)),
-            ResolvedSource::Download(target) => self
-                .shared
-                .downloads
-                .try_push(DownloadJob {
-                    identifier: Arc::clone(&identifier),
-                    request_id,
-                    target,
-                })
-                .map_err(|_| TextureError::QueueFull(QueueKind::Download)),
-        };
-
-        if let Err(error) = queued {
+        if let Err(error) = self.queue_resolved(&identifier, request_id, source) {
             self.fail_reserved(&identifier, request_id, error);
             return Err(error);
+        }
+        Ok(RequestOutcome::Queued)
+    }
+
+    /// Submit work while acquiring its concrete source only when it is needed.
+    ///
+    /// Pending and cached reservations are resolved before the source provider
+    /// is called, and an encoded override wins before native source acquisition.
+    /// The provider runs synchronously without a service lock.
+    /// attach_joined_callback retains the core service's callback fan-out when
+    /// true; ABI compatibility adapters pass false because the legacy host
+    /// ignored later callbacks for an identifier that was already queued.
+    ///
+    /// Service failures are converted with map_service_error. A provider error
+    /// is returned unchanged, and the primary callback is removed before any
+    /// joined callbacks receive a closed failure.
+    pub fn load_with_source<E>(
+        &self,
+        identifier: &str,
+        options: LoadOptions,
+        callback: Option<TextureCallback>,
+        attach_joined_callback: bool,
+        source: impl FnOnce() -> Result<TextureSource, E>,
+        map_service_error: impl Fn(TextureError) -> E,
+    ) -> Result<RequestOutcome, E> {
+        self.validate_identifier(identifier)
+            .map_err(&map_service_error)?;
+        if self.shared.stopping.load(Ordering::Acquire) {
+            return Err(map_service_error(TextureError::ServiceStopped));
+        }
+
+        let identifier: Arc<str> = Arc::from(identifier);
+        let reserved = self
+            .reserve_request(&identifier, options, callback, attach_joined_callback)
+            .map_err(&map_service_error)?;
+        let Reservation::New {
+            request_id,
+            primary_callback_id,
+        } = reserved
+        else {
+            return self
+                .finish_existing_reservation(reserved)
+                .map_err(map_service_error);
+        };
+
+        let resolved = match self.resolve_override(&identifier) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                let source = match source() {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.fail_reserved_excluding(
+                            &identifier,
+                            request_id,
+                            TextureError::DecodeFailed,
+                            primary_callback_id,
+                        );
+                        return Err(error);
+                    }
+                };
+                match self.resolve_source(source) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.fail_reserved_excluding(
+                            &identifier,
+                            request_id,
+                            error,
+                            primary_callback_id,
+                        );
+                        return Err(map_service_error(error));
+                    }
+                }
+            }
+            Err(error) => {
+                self.fail_reserved_excluding(&identifier, request_id, error, primary_callback_id);
+                return Err(map_service_error(error));
+            }
+        };
+
+        if let Err(error) = self.queue_resolved(&identifier, request_id, resolved) {
+            self.fail_reserved_excluding(&identifier, request_id, error, primary_callback_id);
+            return Err(map_service_error(error));
         }
         Ok(RequestOutcome::Queued)
     }
@@ -527,17 +595,24 @@ impl TextureService {
         identifier: &Arc<str>,
         options: LoadOptions,
         callback: Option<TextureCallback>,
+        attach_joined_callback: bool,
     ) -> Result<Reservation, TextureError> {
         let mut state = self.lock_state();
+        let registration = callback.map(|callback| {
+            let id = state.next_callback_id;
+            state.next_callback_id = state.next_callback_id.wrapping_add(1).max(1);
+            CallbackRegistration {
+                id,
+                owner: options.owner,
+                callback,
+            }
+        });
         if let Some(pending) = state.pending.get_mut(identifier.as_ref()) {
-            if let Some(callback) = callback {
+            if attach_joined_callback && let Some(registration) = registration {
                 if pending.callbacks.len() >= self.shared.config.max_callbacks_per_texture {
                     return Err(TextureError::CallbackLimit);
                 }
-                pending.callbacks.push(CallbackRegistration {
-                    owner: options.owner,
-                    callback,
-                });
+                pending.callbacks.push(registration);
             }
             pending.owners.insert(options.owner);
             return Ok(Reservation::Joined);
@@ -548,7 +623,7 @@ impl TextureService {
                 return Ok(Reservation::Cached {
                     texture,
                     owner: options.owner,
-                    callback,
+                    callback: registration.map(|registration| registration.callback),
                     identifier: Arc::clone(identifier),
                 });
             }
@@ -560,14 +635,8 @@ impl TextureService {
         state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
         let mut owners = HashSet::new();
         owners.insert(options.owner);
-        let callbacks = callback
-            .map(|callback| {
-                vec![CallbackRegistration {
-                    owner: options.owner,
-                    callback,
-                }]
-            })
-            .unwrap_or_default();
+        let primary_callback_id = registration.as_ref().map(|registration| registration.id);
+        let callbacks = registration.into_iter().collect();
         state.pending.insert(
             Arc::clone(identifier),
             PendingRequest {
@@ -576,7 +645,10 @@ impl TextureService {
                 callbacks,
             },
         );
-        Ok(Reservation::New { request_id })
+        Ok(Reservation::New {
+            request_id,
+            primary_callback_id,
+        })
     }
 
     fn finish_existing_reservation(
@@ -611,11 +683,35 @@ impl TextureService {
         }
     }
 
-    fn resolve_source(
+    fn queue_resolved(
         &self,
-        identifier: &str,
-        source: TextureSource,
-    ) -> Result<ResolvedSource, TextureError> {
+        identifier: &Arc<str>,
+        request_id: u64,
+        source: ResolvedSource,
+    ) -> Result<(), TextureError> {
+        match source {
+            ResolvedSource::Decode(source) => self
+                .shared
+                .work
+                .try_push(DecodeJob {
+                    identifier: Arc::clone(identifier),
+                    request_id,
+                    source,
+                })
+                .map_err(|_| TextureError::QueueFull(QueueKind::Work)),
+            ResolvedSource::Download(target) => self
+                .shared
+                .downloads
+                .try_push(DownloadJob {
+                    identifier: Arc::clone(identifier),
+                    request_id,
+                    target,
+                })
+                .map_err(|_| TextureError::QueueFull(QueueKind::Download)),
+        }
+    }
+
+    fn resolve_override(&self, identifier: &str) -> Result<Option<ResolvedSource>, TextureError> {
         let override_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.overrides
                 .load_override(identifier, self.shared.config.max_encoded_bytes)
@@ -624,9 +720,12 @@ impl TextureService {
         .map_err(|_| TextureError::OverrideUnavailable)?;
         if let Some(encoded) = override_result {
             self.validate_encoded(&encoded)?;
-            return Ok(ResolvedSource::Decode(DecodeSource::Encoded(encoded)));
+            return Ok(Some(ResolvedSource::Decode(DecodeSource::Encoded(encoded))));
         }
+        Ok(None)
+    }
 
+    fn resolve_source(&self, source: TextureSource) -> Result<ResolvedSource, TextureError> {
         match source {
             TextureSource::File(path) => Ok(ResolvedSource::Decode(DecodeSource::File(path))),
             TextureSource::Memory(encoded) => {
@@ -717,13 +816,29 @@ impl TextureService {
     }
 
     fn fail_reserved(&self, identifier: &Arc<str>, request_id: u64, error: TextureError) {
+        self.fail_reserved_excluding(identifier, request_id, error, None);
+    }
+
+    fn fail_reserved_excluding(
+        &self,
+        identifier: &Arc<str>,
+        request_id: u64,
+        error: TextureError,
+        excluded_callback_id: Option<u64>,
+    ) {
         let callbacks = {
             let mut state = self.lock_state();
             match state.pending.get(identifier.as_ref()) {
                 Some(pending) if pending.request_id == request_id => state
                     .pending
                     .remove(identifier.as_ref())
-                    .map(|pending| pending.callbacks)
+                    .map(|pending| {
+                        pending
+                            .callbacks
+                            .into_iter()
+                            .filter(|registration| Some(registration.id) != excluded_callback_id)
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 _ => Vec::new(),
             }
@@ -812,6 +927,7 @@ impl Drop for TextureService {
 enum Reservation {
     New {
         request_id: u64,
+        primary_callback_id: Option<u64>,
     },
     Cached {
         texture: TextureHandle,

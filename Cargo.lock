@@ -315,11 +315,14 @@ dependencies = [
  "nexus-addon-ffi",
  "nexus-core",
  "nexus-data-services",
+ "nexus-imgui-compat",
  "nexus-inline-hooks",
  "nexus-input",
  "nexus-native-memory",
  "nexus-platform",
+ "nexus-textures",
  "nexus-ui-host",
+ "nexus-ui-services",
  "thiserror",
 ]
 
