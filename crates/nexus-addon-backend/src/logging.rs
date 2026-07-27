@@ -49,13 +49,26 @@ impl LoggingApi {
         Ok(())
     }
 
+    /// Maps an add-on's severity onto a host level.
+    ///
+    /// `0` and `6` are accepted rather than rejected. The reference's `StringFrom`
+    /// (`src/Core/Logging/LogConst.cpp:18-31`) renders any value outside `CRITICAL..TRACE`
+    /// as `(null)` and still writes the line, and its dispatch is a plain
+    /// `msg->Level <= sink.Level`. Rejecting these dropped an add-on's log line outright,
+    /// which is a silent loss of the diagnostic a bug report is built from.
+    ///
+    /// A value above `6` has no host representation. The reference would render it
+    /// `(null)` and then filter it out at every sink, since no sink level is that high, so
+    /// discarding it here produces the same observable result: nothing in the log.
     fn message_level(&self, level: AbiLogLevel) -> Result<LogLevel, BackendOperationError> {
         let level = match level.0 {
+            0 => LogLevel::Off,
             1 => LogLevel::Critical,
             2 => LogLevel::Warning,
             3 => LogLevel::Info,
             4 => LogLevel::Debug,
             5 => LogLevel::Trace,
+            6 => LogLevel::All,
             _ => {
                 self.boundary
                     .failures()
@@ -111,13 +124,20 @@ mod tests {
     }
 
     #[test]
-    fn only_message_levels_cross_the_native_boundary() {
+    fn every_level_the_reference_accepts_crosses_the_native_boundary() {
         let api = api();
         assert_eq!(api.message_level(AbiLogLevel(1)), Ok(LogLevel::Critical));
         assert_eq!(api.message_level(AbiLogLevel(5)), Ok(LogLevel::Trace));
-        assert!(api.message_level(AbiLogLevel(0)).is_err());
-        assert!(api.message_level(AbiLogLevel(6)).is_err());
+
+        // The reference renders these `(null)` and still writes the line, so rejecting
+        // them silently loses an add-on's log output.
+        assert_eq!(api.message_level(AbiLogLevel(0)), Ok(LogLevel::Off));
+        assert_eq!(api.message_level(AbiLogLevel(6)), Ok(LogLevel::All));
+
+        // Above 6 there is no host level, and the reference would filter it out of every
+        // sink anyway, so nothing observable is lost by refusing it here.
+        assert!(api.message_level(AbiLogLevel(7)).is_err());
         assert!(api.message_level(AbiLogLevel(u32::MAX)).is_err());
-        assert_eq!(api.boundary.failures().snapshot().service_rejected, 3);
+        assert_eq!(api.boundary.failures().snapshot().service_rejected, 2);
     }
 }

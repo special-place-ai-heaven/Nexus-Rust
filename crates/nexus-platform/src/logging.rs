@@ -29,15 +29,16 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    const fn is_message(self) -> bool {
-        matches!(
-            self,
-            Self::Critical | Self::Warning | Self::Info | Self::Debug | Self::Trace
-        )
-    }
-
+    /// Whether a sink at this level accepts `message`.
+    ///
+    /// A plain numeric comparison, matching the reference's
+    /// `if (msg->Level <= aLogger->GetLogLevel())` (`src/Core/Logging/LogApi.cpp:40`).
+    /// It deliberately does **not** require `message.is_message()`: an add-on may pass
+    /// `Off` or `All` as a severity, and the reference emits such a record labelled
+    /// `(null)` rather than discarding it. `Off` is numerically lowest so it passes every
+    /// sink; `All` is highest so only a sink set to `All` accepts it.
     const fn allows(self, message: Self) -> bool {
-        message.is_message() && (message as u32) <= (self as u32)
+        (message as u32) <= (self as u32)
     }
 
     const fn legacy_label(self) -> &'static str {
@@ -301,10 +302,6 @@ impl LogRegistry {
         channel: impl Into<Arc<str>>,
         message: impl Into<Arc<str>>,
     ) -> DispatchReport {
-        if !level.is_message() {
-            return DispatchReport::default();
-        }
-
         let channel = channel.into();
         let message = message.into();
         let record_sequence_guard = lock_unpoison(&self.record_sequence);
@@ -895,6 +892,44 @@ mod tests {
         assert_eq!(history[1].message(), "second");
         assert_eq!(history[1].timestamp().millisecond, 1);
         assert_eq!(clock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// An add-on may pass `Off` or `All` as a severity. The reference dispatches on a
+    /// plain `msg->Level <= sink.Level` and renders anything outside `CRITICAL..TRACE` as
+    /// `(null)`, so such a record must reach the sink rather than be discarded.
+    #[test]
+    fn a_non_message_severity_still_reaches_sinks_labelled_null() {
+        let registry = LogRegistry::with_clock(Arc::new(FixedClock));
+        let sink = Arc::new(RecordingSink::new(LogLevel::Trace));
+        registry.register(Arc::clone(&sink) as Arc<dyn LogSink>);
+
+        // Off is numerically lowest, so it passes every sink.
+        registry.log(LogLevel::Off, "Core", "level zero");
+        // All is highest, so a Trace sink must filter it, exactly as the reference does.
+        registry.log(LogLevel::All, "Core", "level six");
+
+        let records = lock_unpoison(&sink.records);
+        assert_eq!(
+            records.len(),
+            1,
+            "Off must be written and All must be filtered by a Trace sink"
+        );
+        assert_eq!(records[0].message.as_ref(), "level zero");
+        assert_eq!(records[0].level.legacy_label(), "(null)");
+    }
+
+    /// The same record is accepted once the sink itself is set to `All`.
+    #[test]
+    fn a_sink_set_to_all_accepts_the_all_severity() {
+        let registry = LogRegistry::with_clock(Arc::new(FixedClock));
+        let sink = Arc::new(RecordingSink::new(LogLevel::All));
+        registry.register(Arc::clone(&sink) as Arc<dyn LogSink>);
+
+        registry.log(LogLevel::All, "Core", "level six");
+
+        let records = lock_unpoison(&sink.records);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level.legacy_label(), "(null)");
     }
 
     struct RecordingSink {
