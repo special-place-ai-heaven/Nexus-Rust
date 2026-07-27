@@ -138,6 +138,33 @@ unload would survive where the reference sweeps it, leaving a callback that can 
 the sweep there needs a timeout parameter on `finish_unload`, which is why it is a separate
 checkpoint.
 
+### 2.8 Settled: load order is deterministic, and batching is unobservable
+
+The reference's order is the filesystem's — `std::filesystem::directory_iterator` over the
+addon directory — and each addon is **loaded inline as it is discovered**
+(`src/Host/Loader/Loader.cpp:252-387`). Load order decides who wins a contested Quick Access
+shortcut or DataLink identifier, and the order of `EV_ADDON_LOADED`.
+
+**Decision: keep the deterministic sorted order, and load in it.** `normalize_discovery`
+already sorts by lowercased path and rejects duplicates
+(`nexus-addon-manager/src/discovery.rs:248-265`, tested by
+`discovery_is_case_insensitively_sorted_and_rejects_duplicates`). Filesystem order is not
+guaranteed across machines or filesystems; sorted order makes a contested-identifier outcome
+reproducible instead of luck. On NTFS the two usually coincide anyway, since directory
+enumeration is already roughly lexicographic.
+
+**Batching versus inline loading is unobservable through the ABI, which settles the harder
+half of this question.** The concern is that an addon's load callback sees a different set of
+peers under batch loading than under the reference's interleaving. But `AddonAPI_t` exposes
+**no addon-enumeration function at all** — verified against the vendored header, zero matches
+for any addon-listing entry point. An addon can therefore learn about its peers only through
+`EV_ADDON_LOADED`, whose ordering is preserved as long as loading follows the same sorted
+sequence. So the visible contract is the *order*, not the interleaving.
+
+Two discovery divergences remain open under #7 and are not affected by this decision:
+symlinks are skipped where the reference resolves them, and the extension test is
+case-insensitive where the reference's likely is not, so `Foo.DLL` loads here.
+
 ### 2.6 Settled: texture records are process-lifetime, GPU views are not
 
 `ROADMAP.md` requires this decided **before** the addon API is wired, because if ABI
@@ -552,7 +579,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 | 51 | | unknown | Frame time and working set | Pin a budget *before* optimizing: measure median and p99 added `Present` cost and working set for both builds on the same machine and scene, and gate CI on a stated margin. Without a number, "it feels worse" is unfalsifiable |
 | 52 | | diverges | Downloads work on the same networks the C++ build's did | Reference: static OpenSSL over cpp-httplib, `crypt32` available. A corporate MITM root in the Windows store behaves differently under WinHTTP than under bundled OpenSSL, and `WINHTTP_ACCESS_TYPE_NO_PROXY` reaches nothing behind a system proxy. Invisible on a dev machine, total on a locked-down network |
 | 53 | | partial | An addon texture that loaded under the reference still loads | Reference decodes with `stb_image`: lenient, covers PNG/JPG/BMP/TGA/PSD/GIF/HDR/PIC/PNM. Build a corpus from real addons plus damaged files and diff the pass/fail matrix. A silently-unresolved texture looks like an addon with invisible buttons |
-| 54 | | diverges | Which addon loads first | Reference order is the filesystem's, and each addon is loaded **inline as discovered**, so a load callback sees only addons that sorted before it. Decides who wins a contested Quick Access shortcut. Sorted-then-batch is probably better — but record the decision and test it |
+| 54 | | diverges | Which addon loads first — decides who wins a contested Quick Access shortcut or DataLink identifier, and `EV_ADDON_LOADED` order | Filesystem order, each addon loaded **inline as discovered** (`Loader.cpp:252-387`) | **Decided — see §2.8.** Sorted-by-lowercased-path and batched, already implemented and tested. Deterministic across machines where filesystem order is not. Batching is unobservable because `AddonAPI_t` exposes no addon-enumeration function (verified against the vendored header), so peers are visible only via `EV_ADDON_LOADED`, whose order the sorted sequence preserves |
 | 55 | | partial | CJK IME composition and candidate window | ImGui 1.80's Win32 IME support is compiled into the reference. Korean and Chinese are shipped Nexus locales, so this population is explicitly in scope |
 | 56 | | diverges | `Nexus.log` with a second client running | Reference opens truncating with write-sharing **denied**, so the second instance logs nowhere rather than corrupting the first file. Multiboxers are the population most likely to try a swap, and a shredded log destroys the first artifact of every bug report |
 | 57 | | unknown | Whether the cited self-update and banner values are the shipped contract | See rule 2.3. Do not port `.old`/`.update` naming, the `Module:` banner value, or the ArcDPS self-comparison from HEAD |
