@@ -165,6 +165,37 @@ Two discovery divergences remain open under #7 and are not affected by this deci
 symlinks are skipped where the reference resolves them, and the extension test is
 case-insensitive where the reference's likely is not, so `Foo.DLL` loads here.
 
+### 2.9 What actually blocks installing the addon API
+
+`HANDOFF.md` frames the remaining addon work as "compose and install". Composition now
+exists (`ProductionAddonApiBackend::compose`, register #1). Enumerating what `compose`
+demands against what `nexus-runtime` owns pins the blocker to **two missing services**, not
+to composition:
+
+| Service `compose` requires | Runtime status |
+|---|---|
+| `Arc<UiHost>`, `Arc<LogRegistry>`, `Arc<EventService>`, `Arc<DataLinkService>`, `Option<Arc<MinimalScheduler>>` | present in `services.rs` |
+| `Arc<StablePathStore>` | constructible from the existing `PathIndex` |
+| `Arc<RawWndProcRegistry>`, `Arc<ManagedInputBinds>` | present in `input.rs` |
+| `Arc<Mutex<Option<GameInvoker>>>` | present in `game_input.rs` |
+| `Arc<dyn GameOnlyMessageSink>` | present via the game-input sink |
+| `Arc<Mutex<LocalizationService>>` | present in `services.rs` |
+| `Arc<dyn TextureServiceFacade>` | **`RuntimeTextureCoordinator` already implements it** |
+| `Arc<InlineHookService>` | **absent** — never constructed in the runtime. Trivial to add |
+| `Arc<dyn RenderFontService>` | **absent, and this is the real blocker** |
+
+`RuntimeFontCoordinator` exposes only render-side operations — `advance`,
+`take_gpu_rebuild`, `selected_addresses`, `active_identity`, `shutdown` — over
+`ImGuiFontManager`. It has no `get`, `add_from_*`, `release` or `resize`, so the
+addon-facing font surface does not exist in the runtime at all, and it is not merely
+unwired. That is `HANDOFF.md`'s second milestone (the bounded synchronous render-font
+bridge, specified at `HANDOFF.md:351-535`).
+
+**A partial font bridge must not be installed.** Returning a rejection from `get` hands an
+addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
+half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and
+crash". The bridge lands complete, or the API is not installed.
+
 ### 2.6 Settled: texture records are process-lifetime, GPU views are not
 
 `ROADMAP.md` requires this decided **before** the addon API is wired, because if ABI
