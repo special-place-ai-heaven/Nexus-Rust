@@ -1,9 +1,9 @@
 [package]
 name = "nexus-imgui-d3d11"
 description = "Dear ImGui 1.80 renderer with exhaustive D3D11 state restoration"
-version = "0.0.0"
-edition = "2024"
-rust-version = "1.97.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

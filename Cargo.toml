@@ -41,13 +41,14 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
 repository = "https://github.com/special-place-ai-heaven/Nexus-Rust"
 
 [workspace.dependencies]
+embed-resource = "=3.0.11"
 imgui-sys = "=0.7.0"
 nexus-abi = { path = "crates/nexus-abi" }
 nexus-addon-api = { path = "crates/nexus-addon-api" }

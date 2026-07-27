@@ -64,6 +64,12 @@ const ALLOWED_IMPORTS: [&str; 10] = [
     "xinput1_4.dll",
 ];
 
+/// PE resource type identifier for `VS_VERSION_INFO`.
+const RT_VERSION: u32 = 16;
+
+/// Leading field of `VS_FIXEDFILEINFO`, used to locate it inside the resource blob.
+const VS_FIXEDFILEINFO_SIGNATURE: u32 = 0xfeef_04bd;
+
 /// Lowercase prefix for Windows API sets, which are OS components rather than
 /// redistributables.
 ///
@@ -90,7 +96,8 @@ fn run() -> Result<String, String> {
     let mut arguments = env::args_os().skip(1);
     let Some(command) = arguments.next() else {
         return Err(
-            "expected `verify-exports [path]`, `verify-imports [path]`, or `smoke-proxy [path]`"
+            "expected `verify-exports [path]`, `verify-imports [path]`, \
+                    `verify-version [path]`, or `smoke-proxy [path]`"
                 .into(),
         );
     };
@@ -117,6 +124,12 @@ fn run() -> Result<String, String> {
         Ok(format!(
             "verified {} imported modules in {}; the C runtime is linked statically",
             modules.len(),
+            path.display()
+        ))
+    } else if command == OsStr::new("verify-version") {
+        let [major, minor, patch, build] = verify_version(&path)?;
+        Ok(format!(
+            "verified version resource {major}.{minor}.{patch}.{build} in {}",
             path.display()
         ))
     } else if command == OsStr::new("smoke-proxy") {
@@ -261,6 +274,159 @@ fn read_pe_imports(image: &[u8]) -> Result<Vec<String>, String> {
     modules.sort_by_key(|module| module.to_ascii_lowercase());
     modules.dedup_by_key(|module| module.to_ascii_lowercase());
     Ok(modules)
+}
+
+fn verify_version(path: &Path) -> Result<[u16; 4], String> {
+    let image =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let embedded = read_pe_file_version(&image)?;
+    let expected = version_components(env!("CARGO_PKG_VERSION"));
+
+    if embedded != expected {
+        let [ea, eb, ec, ed] = embedded;
+        let [xa, xb, xc, xd] = expected;
+        return Err(format!(
+            "version resource mismatch: the image reports {ea}.{eb}.{ec}.{ed} but the package \
+             version is {} ({xa}.{xb}.{xc}.{xd})\n\
+             xtask and nexus-runtime both inherit `version.workspace = true`, so these agree \
+             unless one crate overrode it",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    Ok(embedded)
+}
+
+/// Reads `VS_FIXEDFILEINFO`'s file version out of the image's `RT_VERSION` resource.
+fn read_pe_file_version(image: &[u8]) -> Result<[u16; 4], String> {
+    let resource = read_version_resource(image)?;
+    let signature = VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes();
+
+    // The structure is 4-byte aligned within the resource, after a variable-length
+    // UTF-16 key, so locate it by its leading signature rather than a fixed offset.
+    let mut offset = 0;
+    while checked_add(offset, 16)? <= resource.len() {
+        if resource
+            .get(offset..)
+            .is_some_and(|tail| tail.starts_with(&signature))
+        {
+            let most = read_u32(resource, checked_add(offset, 8)?)?.to_le_bytes();
+            let least = read_u32(resource, checked_add(offset, 12)?)?.to_le_bytes();
+            // Each DWORD packs the high component in its upper half.
+            return Ok([
+                u16::from_le_bytes([most[2], most[3]]),
+                u16::from_le_bytes([most[0], most[1]]),
+                u16::from_le_bytes([least[2], least[3]]),
+                u16::from_le_bytes([least[0], least[1]]),
+            ]);
+        }
+        offset = checked_add(offset, 4)?;
+    }
+    Err("the version resource contains no VS_FIXEDFILEINFO signature".into())
+}
+
+/// One `IMAGE_RESOURCE_DIRECTORY_ENTRY`, resolved to a file offset.
+struct ResourceEntry {
+    id: u32,
+    offset: usize,
+    is_directory: bool,
+}
+
+fn resource_directory(
+    image: &[u8],
+    base: usize,
+    directory: usize,
+) -> Result<Vec<ResourceEntry>, String> {
+    let named = usize::from(read_u16(image, checked_add(directory, 12)?)?);
+    let identified = usize::from(read_u16(image, checked_add(directory, 14)?)?);
+    let total = checked_add(named, identified)?;
+    let mut entries = Vec::with_capacity(total);
+    for index in 0..total {
+        let entry = checked_add(checked_add(directory, 16)?, checked_mul(index, 8)?)?;
+        let id = read_u32(image, entry)?;
+        let raw = read_u32(image, checked_add(entry, 4)?)?;
+        entries.push(ResourceEntry {
+            id,
+            offset: checked_add(base, usize_from_u32(raw & 0x7fff_ffff)?)?,
+            is_directory: raw & 0x8000_0000 != 0,
+        });
+    }
+    Ok(entries)
+}
+
+/// Descends one level of the resource tree, taking the first child.
+///
+/// A version resource carries a single name and a single language, so the first child
+/// is the only one.
+fn first_resource_child(
+    image: &[u8],
+    base: usize,
+    parent: &ResourceEntry,
+    level: &str,
+) -> Result<ResourceEntry, String> {
+    if !parent.is_directory {
+        return Err(format!(
+            "the {level} resource level is a leaf where a directory was expected"
+        ));
+    }
+    resource_directory(image, base, parent.offset)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("the {level} resource level is empty"))
+}
+
+fn read_version_resource(image: &[u8]) -> Result<&[u8], String> {
+    let headers = read_pe_headers(image)?;
+    if read_u32(image, checked_add(headers.optional, 108)?)? < 3 {
+        return Err("PE image has no resource data directory".into());
+    }
+
+    let resource_rva = read_u32(image, checked_add(headers.optional, 128)?)?;
+    if resource_rva == 0 {
+        return Err(
+            "the PE resource directory is empty, so the image carries no VS_VERSION_INFO \
+             and Windows will report no file properties for it"
+                .into(),
+        );
+    }
+    let base = rva_to_offset(resource_rva, headers.size_of_headers, &headers.sections)?;
+
+    // The tree is three levels deep: type, then name, then language.
+    let types = resource_directory(image, base, base)?;
+    let Some(version) = types.into_iter().find(|entry| entry.id == RT_VERSION) else {
+        return Err("the PE resource directory has no RT_VERSION entry".into());
+    };
+    let name = first_resource_child(image, base, &version, "RT_VERSION name")?;
+    let language = first_resource_child(image, base, &name, "RT_VERSION language")?;
+    if language.is_directory {
+        return Err(
+            "the RT_VERSION language level is a directory where a leaf was expected".into(),
+        );
+    }
+
+    // IMAGE_RESOURCE_DATA_ENTRY: an RVA and a size.
+    let data_rva = read_u32(image, language.offset)?;
+    let data_size = usize_from_u32(read_u32(image, checked_add(language.offset, 4)?)?)?;
+    let data_offset = rva_to_offset(data_rva, headers.size_of_headers, &headers.sections)?;
+    image
+        .get(data_offset..checked_add(data_offset, data_size)?)
+        .ok_or_else(|| "the version resource extends past the end of the image".to_owned())
+}
+
+/// Splits a package version into the four 16-bit components `VERSIONINFO` carries.
+///
+/// Deliberately duplicates the same routine in `crates/nexus-runtime/build.rs`: the two
+/// crates cannot share code without a third crate existing only to hold eight lines, and
+/// `verify_version` exists precisely to catch the two disagreeing.
+fn version_components(version: &str) -> [u16; 4] {
+    // A pre-release tag or build metadata is not a version component, and its own dots
+    // must not be mistaken for one: `1.2.3-rc.4` is three components, not four.
+    let numeric = version.split(['-', '+']).next().unwrap_or_default();
+
+    let mut components = [0u16; 4];
+    for (component, field) in components.iter_mut().zip(numeric.split('.')) {
+        *component = field.parse().unwrap_or_default();
+    }
+    components
 }
 
 struct PeHeaders {
@@ -470,7 +636,7 @@ fn checked_mul(left: usize, right: usize) -> Result<usize, String> {
 mod tests {
     use super::{
         ALLOWED_IMPORT_PREFIX, ALLOWED_IMPORTS, DYNAMIC_RUNTIME_PREFIXES, read_pe_exports,
-        read_pe_imports,
+        read_pe_file_version, read_pe_imports, version_components,
     };
 
     /// Mirrors the classification in `verify_imports` so the policy can be checked
@@ -491,6 +657,18 @@ mod tests {
     fn rejects_non_pe_input() {
         assert!(read_pe_exports(b"not a PE image").is_err());
         assert!(read_pe_imports(b"not a PE image").is_err());
+        assert!(read_pe_file_version(b"not a PE image").is_err());
+    }
+
+    #[test]
+    fn splits_a_package_version_into_four_components() {
+        assert_eq!(version_components("0.1.0"), [0, 1, 0, 0]);
+        assert_eq!(version_components("2026.2.17.1210"), [2026, 2, 17, 1210]);
+        // A pre-release suffix is not expressible in FILEVERSION and is dropped.
+        assert_eq!(version_components("1.2.3-rc.4"), [1, 2, 3, 0]);
+        // Missing components default to zero rather than shifting the rest along.
+        assert_eq!(version_components("7"), [7, 0, 0, 0]);
+        assert_eq!(version_components(""), [0, 0, 0, 0]);
     }
 
     #[test]

@@ -71,7 +71,7 @@ Nine tracks. The letter is a stable handle for commits and checkpoints.
 | Item | WS | Size | Notes |
 |---|---|---|---|
 | ~~`A1` static CRT + import allowlist gate~~ | A | S | **Done.** `.cargo/config.toml` plus `xtask verify-imports`, wired into CI. 18 imports → 11, flip-tested against the preserved dynamic artifact |
-| `A2` `VERSIONINFO` + workspace version | G | S | Version is `0.0.0`; nothing to stamp until it isn't |
+| ~~`A2` `VERSIONINFO` + workspace version~~ | G | S | **Done.** Workspace at `0.1.0`; `build.rs` generates the resource from `CARGO_PKG_VERSION`, `xtask verify-version` asserts it in CI |
 | Dispatch `H` operator homework | H | — | See section 4 — hand off immediately |
 | Kick off `I` asset programme | I | — | See section 5 — longest lead item in the project |
 
@@ -88,8 +88,9 @@ optional polish; it is the only thing that makes the fix stick. If a future tool
 break proc macros, the fix is `--target x86_64-pc-windows-msvc`, which moves the artifact to
 `target/x86_64-pc-windows-msvc/release/` and requires updating four workflow steps.
 
-**Exit:** `xtask verify-imports` passes on a release build; CI runs it; a stamped version
-appears in the image. — *`verify-imports` done; `A2` version stamping outstanding.*
+**Exit:** reached. `xtask verify-imports` and `verify-version` both pass on a release build and
+both run in CI; the image carries `FileVersion 0.1.0.0`. Phase 0's engineering half is closed;
+`H` and `I` remain outstanding and are the long poles.
 
 ---
 

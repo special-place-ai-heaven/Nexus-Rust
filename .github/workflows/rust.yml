@@ -45,6 +45,11 @@ jobs:
       - name: Verify static C runtime and import surface
         run: cargo run -p xtask --release -- verify-imports target/release/d3d11.dll
 
+      # Third-party addon managers identify the installed host by FileVersion. An
+      # unversioned DLL reads as unknown and can be overwritten, undoing the swap.
+      - name: Verify embedded version resource
+        run: cargo run -p xtask --release -- verify-version target/release/d3d11.dll
+
       - name: Smoke-test system forwarding
         run: cargo run -p xtask --release -- smoke-proxy target/release/d3d11.dll
 

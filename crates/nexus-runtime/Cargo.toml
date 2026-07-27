@@ -11,6 +11,9 @@ repository.workspace = true
 name = "d3d11"
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+embed-resource.workspace = true
+
 [dependencies]
 nexus-abi.workspace = true
 nexus-addon-backend.workspace = true

@@ -258,11 +258,26 @@ The original finding, against the pre-fix artifact (19 raw import entries, 18 un
 - **Match module names case-insensitively** — the current build imports both `KERNEL32.dll`
   and `kernel32.dll`.
 
-**A2. `VERSIONINFO` present with `FileVersion` == release version.** Verified absent: the
-resource data directory is **size 0**, and `VS_VERSION_INFO`/`StringFileInfo` do not appear
-in the image. Workspace version is `0.0.0` (`Cargo.toml:44`), so there is nothing to stamp
-yet. Not cosmetic — a third-party GW2 addon manager can treat an unversioned file as
-unknown and overwrite the swapped DLL.
+**A2. `VERSIONINFO` present with `FileVersion` == package version. Status: closed.** The
+workspace version is now `0.1.0`, `crates/nexus-runtime/build.rs` generates the resource
+script from `CARGO_PKG_VERSION` and embeds it via `embed-resource`, and
+`xtask verify-version` asserts the embedded `VS_FIXEDFILEINFO` matches. CI runs it.
+
+The resource directory went from **size 0 to 880 bytes**; the image reports
+`FileVersion 0.1.0.0`, `ProductName "Tessera"`, and a `FileDescription` carrying no
+trademarked game name (§2.5).
+
+The script is **generated rather than checked in**, so the embedded version cannot drift
+from the package version — there is only one source of truth. Flip-tested: the same gate
+binary exits `0` on the real image and `1` on a copy with only the 8-byte resource data
+directory zeroed.
+
+Not cosmetic — a third-party GW2 addon manager can treat an unversioned file as unknown and
+overwrite the swapped DLL.
+
+Two follow-ups this does **not** cover: the four `StringFileInfo` values are asserted only
+by the binary `VS_FIXEDFILEINFO` comparison, not string-by-string; and per #22 the release
+version must eventually equal what the update endpoint advertises.
 
 **A3. Resource inventory.** The reference ships fonts, icons, banners, locale tables and
 the third-party notice blob *inside* the image (`res/Nexus.rc`, `res/ResConst.h`), so one
@@ -375,7 +390,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 | 19 | ● | unreachable | `AddonConfig.json` read at startup, rewritten on change | `CfgManager.cpp:20-248` | Format matches byte-for-byte with a golden test; **no construction site** and no `PathKey` |
 | 20 | ● | diverges | An addon-held `Texture*` survives resize/fullscreen/device loss | Process-lifetime records; resize never frees them | `textures.rs:180-205,296-315` retires the service and every ABI record on re-attach. **Settle this before wiring the addon API, not after** — otherwise every addon-held pointer is a use-after-free on first resize |
 | 21 | ● | unreachable | Self-update, per-addon auto-update, library install, patch mutex | `Updater.cpp:19-318`, `Addon.cpp:588-1309` | Every `update.rs` public fn has zero callers outside the file. Zero hits for `RCGG-Mutex` (verified). No cadence, no scheduler, no library source. The mutex must land in the **same change** as the updater |
-| 22 | ● | absent | `VERSIONINFO`, third-party notices on disk, a downloadable release | `res/Nexus.rc:56-88` | Resource directory **size 0**, no `VS_VERSION_INFO`, version `0.0.0` (all verified). Notices list 4 entries against 129 lockfile packages |
+| 22 | ● | partial | ~~`VERSIONINFO`~~, third-party notices on disk, a downloadable release | `res/Nexus.rc:56-88` | **`VERSIONINFO` done** — `FileVersion 0.1.0.0`, resource directory 880 bytes, gated by `xtask verify-version` (§4.A2). Still absent: notices list 4 entries against 129 lockfile packages, and there is no tagged, stamped, checksummed release job |
 | 23 | ● | absent | A second GW2 client launches; multibox state logged | `Multibox.cpp:128-188`, substring `AN-Mutex-Window-Guild Wars 2` | Options parsed, never read. No mutex code anywhere. Mainstream GW2 workflow |
 | 24 | ● | absent | Live GW2 bind tracking, so addon-issued binds press the player's key | `GbApi.cpp:24-99`, Unofficial Extras event | Zero hits for `UNOFFICIAL_EXTRAS` (verified). Every addon-issued game bind presses the **default** key |
 | 25 | ● | partial | `"ALT+["`, `"CTRL+NUM 7"`, `"SHIFT+CAPS LOCK"` resolve, on any layout | Full OS key-name set, scan codes 0..255 × {plain, extended}, **active layout** | `bind.rs:343-413` covers 61 names, no punctuation/keypad/lock keys; `&UsKeyNames` hardcoded; `parse_bind_lossy` drops modifiers on error. Same table feeds bind *display* |
