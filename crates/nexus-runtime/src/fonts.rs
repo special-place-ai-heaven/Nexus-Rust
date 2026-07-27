@@ -858,9 +858,11 @@ impl Drop for FontSessionLease {
 struct RuntimeRenderObserver {
     fonts: Arc<RuntimeFontCoordinator>,
     textures: Arc<dyn RenderSessionObserver>,
-    /// Produces the add-on API backend for one render session, or `None` when the runtime
-    /// composed no backend. Built per attach so the backend never outlives its session.
-    addon_api: Option<Arc<dyn Fn() -> Arc<dyn AddonApiBackend> + Send + Sync>>,
+    /// Produces the add-on API backend for one render session.
+    ///
+    /// A factory rather than a stored backend, so a backend never outlives the session it
+    /// was installed for.
+    addon_api: Arc<dyn Fn() -> Option<Arc<dyn AddonApiBackend>> + Send + Sync>,
 }
 
 impl RenderSessionObserver for RuntimeRenderObserver {
@@ -884,7 +886,7 @@ impl RenderSessionObserver for RuntimeRenderObserver {
         // leave add-ons holding pointers into a session that never finished attaching.
         // The lease lives in the combined attachment and therefore retires with the
         // session, which is what keeps a table from outliving the context it names.
-        let addon_api = match &self.addon_api {
+        let addon_api = match (self.addon_api)() {
             Some(backend) => {
                 // SAFETY: `resources` describes the live selected swap chain and its Dear
                 // ImGui context, both of which outlive this attachment because the
@@ -896,7 +898,7 @@ impl RenderSessionObserver for RuntimeRenderObserver {
                         resources.generation(),
                         resources.swap_chain(),
                         resources.imgui_context(),
-                        backend(),
+                        backend,
                     )
                 } {
                     Ok(installed) => Some(installed),
@@ -940,7 +942,7 @@ impl Drop for CombinedRenderSessionLease {
 pub(crate) fn production_observer(
     fonts: Arc<RuntimeFontCoordinator>,
     textures: Arc<dyn RenderSessionObserver>,
-    addon_api: Option<Arc<dyn Fn() -> Arc<dyn AddonApiBackend> + Send + Sync>>,
+    addon_api: Arc<dyn Fn() -> Option<Arc<dyn AddonApiBackend>> + Send + Sync>,
 ) -> Arc<dyn RenderSessionObserver> {
     Arc::new(RuntimeRenderObserver {
         fonts,

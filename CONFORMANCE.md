@@ -291,17 +291,22 @@ retires with the session. Two ordering rules are encoded there:
 An install failure degrades to a session without the add-on API rather than refusing the
 attachment, because the overlay still renders and losing it too would be strictly worse.
 
-**The remaining blocker is caller attribution, not plumbing.** `production_observer` is
-passed `None` today. `compose_addon_api` needs a `NativeCallBoundary`, which needs an
-`AddressOwnerResolver` — the addon manager's address-ownership index. Until the runtime links
-`nexus-addon-manager` and loads modules through it, no address resolves to an owner, so every
-API call would fail attribution. That would install a backend which rejects everything: worse
-than none, because add-ons would load and find a dead table. Register #5 covers the related
-rule that read-only queries should be served without attribution at all.
+**The API is now installed on every render session.** The runtime owns a process-wide
+`AddressOwnershipIndex`, builds a `NativeCallBoundary` over it, composes the backend once all
+services exist, and the observer installs it per attach.
 
-So the honest order for the next step is: link the loader and manager, load one module, and
-pass the resulting ownership index in — at which point the `None` becomes a composed backend
-and the install turns on.
+An earlier note here claimed the install had to wait for the addon manager because
+attribution would otherwise fail on every call. That was wrong and is corrected: an **empty**
+ownership index is the correct starting state, not a broken one. With no add-on loaded there
+is no add-on call to attribute, and a loader publishes each module's address range into the
+index as it activates it. The index is created in the runtime and must be **shared** with
+whatever loads modules, or attribution would consult a different map than the one being
+populated.
+
+**What genuinely remains for add-ons to load** is the loader itself: `nexus-runtime` must link
+`nexus-addon-loader`, `-manager`, `-watch` and `-cleanup`, scan `<GW2>/addons`, and drive each
+module through the lifecycle while publishing its address range into this same index. The API
+table is ready to receive them.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
@@ -664,7 +669,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 
 | # | B | Status | Surface | Reference | Rust |
 |---|---|---|---|---|---|
-| 1 | ● | unreachable | **Zero addons load.** No scan, no DLL loaded, no load callback, no API table | `HoContext.cpp:64-70`, `Loader.cpp:252-255,389-410` | `nexus-runtime` still depends only on `nexus-addon-backend` among the addon crates. **Progress:** `ProductionAddonApiBackend::compose` is now the single wiring point for all 13 adapters and is tested by serving a real path call through a fully composed backend — it previously had no non-test constructor at all. Remaining: the runtime dependency edges plus a call to `compose` with its own services. Root cause of ~20 other `unreachable` items |
+| 1 | ● | partial | **Zero addons load.** No scan, no DLL loaded, no load callback | `HoContext.cpp:64-70`, `Loader.cpp:252-255,389-410` | **The API table is now composed and installed per render session** (§2.9): the runtime owns an `AddressOwnershipIndex`, builds the call boundary over it, composes all 13 adapters, and `RuntimeRenderObserver::attach` installs the table with its lease retiring alongside the session. **Still absent: the loader.** Nothing scans `<GW2>/addons` or drives a module through the lifecycle, so no address is ever published into the index and no addon exists to call the table. Needs `-loader`/`-manager`/`-watch`/`-cleanup` linked and sharing that index |
 | 2 | ● | diverges | Overlay attaches; must not require a window-class literal | Class-agnostic: `Hooks.cpp:232-242`, `PlContext.cpp:34-56`. `ArenaNet_Dx_Window_Class` appears **nowhere** in the C++ tree (verified) | `dxgi.rs:31` + `set_require_expected_game_window(true)`; rejections at `classifier.rs:46-49,98-106` |
 | 3 | ● | matches | Byte layout of every addon-facing structure: API tables v1-v6, AddonDefinition, Version, InputBind, Texture, Mumble data/context/identity, NexusLink | `ApiV1.h`–`ApiV6.h`, `AddonDefV1.h:28-44` | **Revision 6 now externally verified** by `xtask verify-abi`: MSVC checks 60 facts against the vendored MIT header (§4.A4). v1–v5 are absent from the public header and remain author-computed; upstream `NexusLinkData_t` stops at `FontUI` so its quick-access tail is likewise unverified |
 | 4 | ● | partial | An addon's unload routine can still call every API function it used during load | Order is: invoke the addon's unload export while the complete API is functional for it, then sweep host-side registrations pointing into the module, then release it (`Addon.cpp:418-432`) | **The crash vector is fixed.** `request_unload` no longer closes addon-to-host API admission; `invoke_native_unload` closes it once the export has returned, so `GetAddonDirectory` no longer hands back a null pointer that addons concatenate. Flip-tested. **Still diverging:** the host-side registration sweep still runs *before* the unload export rather than after, so a registration an addon creates during its own unload would survive where the reference sweeps it — see §2.7 |

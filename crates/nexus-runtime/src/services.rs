@@ -11,7 +11,10 @@ use nexus_addon_backend::{
     AddonApiServices, BackendFailures, NativeCallBoundary, ProductionAddonApiBackend,
     StablePathError, StablePathStore, TextureServiceFacade,
 };
+use nexus_addon_ffi::{AddonApiBackend, AddonCallerResolver, AddressOwnerResolver};
+use nexus_core::AddressOwnershipIndex;
 use nexus_inline_hooks::InlineHookService;
+use nexus_native_memory::NativeMemoryReader;
 
 use nexus_abi::{
     DL_MUMBLE_LINK, DL_MUMBLE_LINK_IDENTITY, EV_MUMBLE_IDENTITY_UPDATED, MumbleData,
@@ -188,16 +191,22 @@ impl RuntimeServices {
             Arc::clone(&textures),
             paths.get(PathKey::TexturesDirectory).to_path_buf(),
         );
-        // The add-on API is not installed yet, and passing `None` here is deliberate
-        // rather than unfinished plumbing. `compose_addon_api` needs a
-        // `NativeCallBoundary`, which needs an `AddressOwnerResolver` — the addon
-        // manager's address-ownership index. Until this runtime links the addon manager
-        // and loads modules through it, no address resolves to an owner, so every API call
-        // would fail caller attribution: a backend that is installed but rejects
-        // everything, which is worse than none because add-ons would load and then find a
-        // dead table. See `CONFORMANCE.md` §2.9.
-        let render_observer =
-            crate::fonts::production_observer(Arc::clone(&fonts), texture_observer, None);
+        // Process-wide address ownership. An empty index is the correct starting state,
+        // not a broken one: with no add-on loaded there is no add-on call to attribute, and
+        // a loader publishes each module's address range here as it activates it. The same
+        // index must be shared with whatever loads modules, or attribution would consult a
+        // different map than the one being populated.
+        let address_ownership = Arc::new(AddressOwnershipIndex::new());
+        // The backend cannot be composed here: it needs the input and game-input services,
+        // which are built below. A slot filled once at the end of construction avoids
+        // reordering the whole builder, and the observer reads it per attach.
+        let addon_api: Arc<OnceLock<Arc<dyn AddonApiBackend>>> = Arc::new(OnceLock::new());
+        let addon_api_reader = Arc::clone(&addon_api);
+        let render_observer = crate::fonts::production_observer(
+            Arc::clone(&fonts),
+            texture_observer,
+            Arc::new(move || addon_api_reader.get().map(Arc::clone)),
+        );
         let (game_input, game_input_error) =
             crate::game_input::RuntimeGameInput::load(paths.get(PathKey::GameBinds).to_path_buf());
         if let Some(error) = game_input_error {
@@ -219,7 +228,7 @@ impl RuntimeServices {
         );
         let scaling = RuntimeScaling::load(Arc::clone(&settings));
 
-        Ok(Self {
+        let services = Self {
             _paths: paths,
             _settings: settings,
             _data_link: data_link,
@@ -236,7 +245,27 @@ impl RuntimeServices {
             scaling,
             logger,
             scheduler,
-        })
+        };
+
+        // Compose now that every service exists. A failure here loses the add-on API but
+        // keeps the overlay, so it is reported rather than propagated.
+        let failures = Arc::new(BackendFailures::new());
+        let callers = Arc::new(AddonCallerResolver::new(
+            Arc::clone(&address_ownership) as Arc<dyn AddressOwnerResolver>
+        ));
+        let boundary = Arc::new(NativeCallBoundary::new(
+            callers,
+            NativeMemoryReader::default(),
+            Arc::clone(&failures),
+        ));
+        match services.compose_addon_api(&services._paths, boundary, failures) {
+            Ok(backend) => {
+                let _ = addon_api.set(Arc::new(backend) as Arc<dyn AddonApiBackend>);
+            }
+            Err(error) => crate::diagnostics::report_proxy_failure(&error),
+        }
+
+        Ok(services)
     }
 
     fn shutdown_game_input(&self) {
