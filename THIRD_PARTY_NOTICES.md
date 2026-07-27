@@ -8,6 +8,10 @@ This is the initial inventory of third-party projects directly referenced by or 
 - License: MIT
 - Use: normative public reference for the Nexus add-on ABI, including `Nexus.h`
 - Reference revision: `9b2c53df86c00db6495642bfcff2d0611bd957ef`
+- **Redistributed** at `vendor/nexus-api/`, verbatim at that revision, with the upstream
+  MIT license text at `vendor/nexus-api/LICENSE` as the license requires. `Nexus.h` is a
+  build-time input to `cargo run -p xtask -- verify-abi`, which has MSVC check this
+  project's ABI offsets against it. It is not compiled into the shipped binary.
 
 ## Dear ImGui
 

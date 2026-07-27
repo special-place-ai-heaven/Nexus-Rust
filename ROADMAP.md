@@ -103,7 +103,7 @@ diagnosably — and none of it needs a game.
 
 | Item | WS | Size | Notes |
 |---|---|---|---|
-| `A4` MSVC offset oracle for v1–v6 + all ABI structs | B | M | **The single highest-value gate.** Emit offsets from Rust, diff against `offsetof` from one MSVC TU built from the public MIT header |
+| ~~`A4` MSVC offset oracle~~ | B | M | **Done for revision 6.** `xtask verify-abi` has MSVC confirm 60 facts against the vendored MIT header, in CI. v1–v5 are not in the public header, so they stay author-computed — see the `CONFORMANCE.md` §4.A4 scope note |
 | `A4` interior offsets for v2/v3/v4; `GetAddonDef` and ImGui-version asserts | B | S | Size-only today |
 | `A5` export directory assertions | B | S | Partly exists |
 | `A6` TLS callbacks + no-`Drop`-`thread_local` rule | B | S | The image has a TLS directory today, so this is live |

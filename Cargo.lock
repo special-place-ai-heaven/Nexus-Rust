@@ -1263,6 +1263,8 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "nexus-abi",
  "windows-sys 0.61.2",
 ]
 

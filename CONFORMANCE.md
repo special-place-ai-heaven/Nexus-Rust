@@ -284,13 +284,36 @@ the third-party notice blob *inside* the image (`res/Nexus.rc`, `res/ResConst.h`
 file drop is a complete install. Assert the decision per resource id — an empty resource
 directory is currently indistinguishable from "not started".
 
-**A4. The single highest-value gate: an external offset oracle.** API table offsets for
-v1–v6 currently pass, and two independent surveys hand-checked them against the headers
-(#3). The residual risk is that expectations are *author-computed*, so a shared mistake
-passes. Close it: emit the offset table from Rust and diff it in CI against `offsetof`
-output from one MSVC translation unit built from the public MIT `RaidcoreGG/Nexus-API`
-header. Also add interior offset assertions for v2/v3/v4 (size-only today), and
-compile-time asserts on the literal `"GetAddonDef"` and `imgui_version_num() == 18000`.
+**A4. The single highest-value gate: an external offset oracle. Status: closed for
+revision 6.** `cargo run -p xtask -- verify-abi` emits the offsets Rust actually computes
+into a C++ translation unit of `static_assert`s against the vendored MIT upstream header
+and compiles it with MSVC. **60 layout facts confirmed.** Nothing is linked or run:
+compilation succeeding *is* the agreement, and a mismatch is a compiler error naming the
+field. CI runs it.
+
+This removes the human from the loop, which was the whole point — every other layout check
+compares Rust against expectations a human read off a header, so a shared mistake passed
+silently.
+
+Flip-tested: injecting `+ 8` into one sub-table offset yields
+`error C2338: static assertion failed: 'AddonApiV6 sub-table at upstream member
+GameBinds_PressAsync'`. Three unit tests additionally guard the vacuous-pass mode, because
+a translation unit that asserts *nothing* also compiles: the table must hold ≥50 facts,
+each fact must emit exactly one assertion, and the generated unit must include the
+vendored header.
+
+**Scope boundary — what this cannot settle.** `vendor/nexus-api/Nexus.h` declares
+`NEXUS_API_VERSION 6` and exactly one `AddonAPI_t`, so **revisions 1–5 are absent from the
+public header** and remain checked against hand-read expectations in `nexus-abi`'s own
+tests. Separately, upstream `NexusLinkData_t` **ends at `FontUI` (40 bytes)** where the
+host publishes 56 with the quick-access fields — the public header is behind the host
+struct, so only the shared prefix is externally verified. The boundary itself is asserted,
+so a future header that grows the struct is noticed rather than silently leaving the tail
+unchecked.
+
+Still outstanding from this gate: interior offset assertions for v2/v3/v4 (size-only
+today), and compile-time asserts on the literal `"GetAddonDef"` and
+`imgui_version_num() == 18000`.
 
 **A5. Export directory:** name == `d3d11.dll`, 20 non-forwarder exports, no duplicate
 ordinals, `AddressOfEntryPoint` not reaching Nexus code.
@@ -371,7 +394,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 |---|---|---|---|---|---|
 | 1 | ● | unreachable | **Zero addons load.** No scan, no DLL loaded, no load callback, no API table | `HoContext.cpp:64-70`, `Loader.cpp:252-255,389-410` | `nexus-runtime/Cargo.toml:16` depends only on `nexus-addon-backend` — not on `-ffi`/`-loader`/`-manager`/`-watch`/`-cleanup`/`nexus-host`. **Verified.** Root cause of ~20 other `unreachable` items |
 | 2 | ● | diverges | Overlay attaches; must not require a window-class literal | Class-agnostic: `Hooks.cpp:232-242`, `PlContext.cpp:34-56`. `ArenaNet_Dx_Window_Class` appears **nowhere** in the C++ tree (verified) | `dxgi.rs:31` + `set_require_expected_game_window(true)`; rejections at `classifier.rs:46-49,98-106` |
-| 3 | ● | matches | Byte layout of every addon-facing struct; v1=256B … v6=496B | `ApiV1.h`–`ApiV6.h`, `AddonDefV1.h:28-44` | `nexus-abi/src/api.rs:271-541` + asserts `:552-588`. Needs the A4 external oracle |
+| 3 | ● | matches | Byte layout of every addon-facing structure: API tables v1-v6, AddonDefinition, Version, InputBind, Texture, Mumble data/context/identity, NexusLink | `ApiV1.h`–`ApiV6.h`, `AddonDefV1.h:28-44` | **Revision 6 now externally verified** by `xtask verify-abi`: MSVC checks 60 facts against the vendored MIT header (§4.A4). v1–v5 are absent from the public header and remain author-computed; upstream `NexusLinkData_t` stops at `FontUI` so its quick-access tail is likewise unverified |
 | 4 | ● | diverges | An addon's unload routine can still call every API it used at load | `Addon.cpp:418-432`: native unload runs **first**, with the API fully live; sweep after | `manager.rs:1193,1203-1253,1263-1296` inverts it. `GetAddonDirectory` returns NULL and addons concatenate it — a crash vector. `HANDOFF.md:654-665` prescribes the *inverted* order |
 | 5 | ● | diverges | API calls work from any thread and any call stack | No caller authentication; attribution failure never denies (`ApiBuilder.cpp:173-215`) | `boundary.rs:147-162` fails closed; `dispatcher.rs:295-308` returns null. Breaks worker threads, timer callbacks, MinHook trampolines |
 | 6 | ● | diverges | Non-UTF-8 / long / heap-allocated addon metadata still loads | Opaque NUL-terminated bytes; no provenance check | `definition.rs:430` rejects invalid UTF-8; ceilings reject rather than truncate; `module.rs:312-361` rejects out-of-image definitions |

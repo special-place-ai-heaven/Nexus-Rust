@@ -1,5 +1,7 @@
 //! Repository verification tasks that need to inspect built artifacts.
 
+mod abi;
+
 use std::{
     collections::BTreeMap,
     env,
@@ -95,12 +97,22 @@ fn main() -> ExitCode {
 fn run() -> Result<String, String> {
     let mut arguments = env::args_os().skip(1);
     let Some(command) = arguments.next() else {
-        return Err(
-            "expected `verify-exports [path]`, `verify-imports [path]`, \
-                    `verify-version [path]`, or `smoke-proxy [path]`"
-                .into(),
-        );
+        return Err("expected `verify-abi`, or `verify-exports [path]`, \
+                    `verify-imports [path]`, `verify-version [path]`, \
+                    `smoke-proxy [path]`"
+            .into());
     };
+
+    // This one inspects source layout rather than a built artifact, so it takes no path.
+    if command == OsStr::new("verify-abi") {
+        if arguments.next().is_some() {
+            return Err("verify-abi takes no arguments".into());
+        }
+        let checked = abi::verify_abi()?;
+        return Ok(format!(
+            "MSVC confirmed {checked} ABI layout facts against vendor/nexus-api/Nexus.h"
+        ));
+    }
 
     let path = arguments
         .next()

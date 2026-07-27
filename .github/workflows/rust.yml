@@ -28,6 +28,11 @@ jobs:
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Has MSVC check Rust's add-on ABI offsets against the vendored upstream header,
+      # so a layout mistake cannot pass merely because a human made it in both places.
+      - name: Verify ABI layout against upstream Nexus.h
+        run: cargo run -p xtask --release -- verify-abi
+
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
