@@ -143,7 +143,7 @@ Then, in order:
 
 | Item | WS | Size | Notes |
 |---|---|---|---|
-| `#1` link the addon subsystem | C | M | The dependency edge plus a real construction site. Unblocks ~20 items |
+| `#1` link the addon subsystem | C | M | **`ProductionAddonApiBackend::compose` now exists** — the single wiring point for all 13 adapters, tested by serving a real call through a fully composed backend. Remaining: `nexus-runtime` must depend on the addon crates and call it with its own services. Unblocks ~20 items |
 | `#4` unload-export ordering | C | M | Contradicts `HANDOFF.md:654-665` |
 | `#5` caller attribution serves unattributable callers | C | M | Serve with a null owner; reserve rejection for owner-scoped cleanup, never read-only queries |
 | `#6` metadata validation → lossy + truncate | C | S | Keep the bounded string reads; relax definition-in-image to bounded readability |

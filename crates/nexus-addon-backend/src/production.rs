@@ -4,7 +4,7 @@ use core::{
     ffi::{c_char, c_void},
     fmt, ptr,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nexus_abi::{
     EventCallback, GameBind, InputBindCallbackV1, InputBindCallbackV2, InputBindV1, LogLevel,
@@ -12,12 +12,55 @@ use nexus_abi::{
     WndProcCallback,
 };
 use nexus_addon_ffi::AddonApiBackend;
+use nexus_data_services::{DataLinkService, EventService};
+use nexus_inline_hooks::InlineHookService;
+use nexus_input::{GameInvoker, GameOnlyMessageSink, ManagedInputBinds, RawWndProcRegistry};
+use nexus_platform::{LogRegistry, MinimalScheduler};
+use nexus_ui_host::UiHost;
+use nexus_ui_services::LocalizationService;
 
 use crate::{
-    BackendOperationError, DataLinkApi, EventApi, FontBackend, GameBindBackend, InlineHookApi,
-    InputBindBackend, LocalizationBackend, LoggingApi, PathApi, TextureBackend, UiApi,
-    UpdateBackend, WndProcBackend,
+    BackendFailures, BackendOperationError, DataLinkApi, EventApi, FontApi, FontBackend,
+    GameBindApi, GameBindBackend, InlineHookApi, InputBindApi, InputBindBackend, LocalizationApi,
+    LocalizationBackend, LoggingApi, NativeCallBoundary, PathApi, RenderFontService,
+    StablePathStore, TextureApi, TextureBackend, TextureServiceFacade, UiApi, UpdateApi,
+    UpdateBackend, WndProcApi, WndProcBackend,
 };
+
+/// Every process service the native add-on API is built from.
+///
+/// Named separately from the two adapter bundles so an embedding runtime hands over the
+/// services it already owns and does not have to know which adapter wraps which one.
+pub struct AddonApiServices {
+    /// UI host owning render callbacks, alerts and close-on-escape.
+    pub ui_host: Arc<UiHost>,
+    /// Process log registry.
+    pub logs: Arc<LogRegistry>,
+    /// Process-lifetime native path storage.
+    pub paths: Arc<StablePathStore>,
+    /// Owner-scoped inline hook service.
+    pub inline_hooks: Arc<InlineHookService>,
+    /// Event registry raising and dispatching named events.
+    pub events: Arc<EventService>,
+    /// Shared-memory resource registry.
+    pub data_link: Arc<DataLinkService>,
+    /// Raw window-message callback registry.
+    pub wnd_proc_callbacks: Arc<RawWndProcRegistry>,
+    /// Sink delivering a message to the game only.
+    pub game_messages: Arc<dyn GameOnlyMessageSink>,
+    /// Managed input-bind registry.
+    pub input_binds: Arc<ManagedInputBinds>,
+    /// Game-bind invoker lifecycle slot.
+    pub game_invoker: Arc<Mutex<Option<GameInvoker>>>,
+    /// Optional scheduler for asynchronous game binds.
+    pub game_scheduler: Option<Arc<MinimalScheduler>>,
+    /// Texture service selected for the active render session.
+    pub textures: Arc<dyn TextureServiceFacade>,
+    /// Localization service advanced on the render thread.
+    pub localization: Arc<Mutex<LocalizationService>>,
+    /// Render-thread font service.
+    pub fonts: Arc<dyn RenderFontService>,
+}
 
 /// Validated adapters for the 28 operations already backed by typed services.
 #[derive(Clone)]
@@ -137,6 +180,59 @@ impl ProductionAddonApiBackend {
     #[must_use]
     pub fn new(core: CoreAddonApiServices, required: RequiredAddonApiServices) -> Self {
         Self { core, required }
+    }
+
+    /// Builds the whole backend from the process services an embedding runtime owns.
+    ///
+    /// This is the single place the thirteen adapters are wired, so a runtime cannot
+    /// half-install the API by composing some bundles and forgetting others.
+    ///
+    /// `failures` must be the same counter set the boundary was built with: the game-bind
+    /// adapter owns no boundary and records against it directly, so passing a different
+    /// set would silently split the diagnostics in two.
+    #[must_use]
+    pub fn compose(
+        boundary: Arc<NativeCallBoundary>,
+        failures: Arc<BackendFailures>,
+        services: AddonApiServices,
+    ) -> Self {
+        let core = CoreAddonApiServices::new(
+            Arc::new(UiApi::new(Arc::clone(&boundary), services.ui_host)),
+            Arc::new(LoggingApi::new(Arc::clone(&boundary), services.logs)),
+            Arc::new(PathApi::new(Arc::clone(&boundary), services.paths)),
+            Arc::new(InlineHookApi::new(
+                Arc::clone(&boundary),
+                services.inline_hooks,
+            )),
+            Arc::new(EventApi::new(Arc::clone(&boundary), services.events)),
+            Arc::new(DataLinkApi::new(Arc::clone(&boundary), services.data_link)),
+        );
+
+        let required = RequiredAddonApiServices::new(
+            Arc::new(UpdateApi::new(Arc::clone(&boundary))),
+            Arc::new(WndProcApi::new(
+                Arc::clone(&boundary),
+                services.wnd_proc_callbacks,
+                services.game_messages,
+            )),
+            Arc::new(InputBindApi::new(
+                Arc::clone(&boundary),
+                services.input_binds,
+            )),
+            Arc::new(GameBindApi::new(
+                failures,
+                services.game_invoker,
+                services.game_scheduler,
+            )),
+            Arc::new(TextureApi::new(Arc::clone(&boundary), services.textures)),
+            Arc::new(LocalizationApi::new(
+                Arc::clone(&boundary),
+                services.localization,
+            )),
+            Arc::new(FontApi::new(boundary, services.fonts)),
+        );
+
+        Self::new(core, required)
     }
 }
 
@@ -640,7 +736,7 @@ fn value_or<T: Copy>(result: Result<T, BackendOperationError>, fallback: T) -> T
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroUsize;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     use nexus_addon_ffi::{AddonCallerResolver, AddressOwnerResolver};
@@ -649,12 +745,24 @@ mod tests {
         DataLinkService, EventService, MappingBackend, MappingFailure, MappingView,
     };
     use nexus_inline_hooks::InlineHookService;
+    use nexus_input::{CallbackLimits, GameSinkError, InlineExecutor};
     use nexus_native_memory::NativeMemoryReader;
-    use nexus_platform::{LogRegistry, PathIndex, PathRoots};
+    use nexus_platform::{LogRegistry, PathIndex, PathKey, PathRoots};
+    use nexus_textures::{
+        LoadOptions, OwnerGeneration, RequestOutcome, TextureCallback, TextureHandle,
+    };
     use nexus_ui_host::UiHost;
+    use nexus_ui_services::{
+        FontConfig, FontGetResult, FontRegistration, OwnerId, ResourceFont, SubscriptionId,
+    };
+
+    use std::path::PathBuf;
 
     use super::*;
-    use crate::{BackendFailures, NativeCallBoundary, StablePathStore};
+    use crate::{
+        BackendFailures, NativeCallBoundary, RequiredServiceResult, SendFontCallback,
+        StablePathStore, TextureFacadeError, TextureSourceFactory, TextureSourceFailurePolicy,
+    };
 
     type SpyResult<T> = Result<T, BackendOperationError>;
 
@@ -1152,6 +1260,199 @@ mod tests {
         ) -> Result<Arc<dyn MappingView>, MappingFailure> {
             Err(MappingFailure::UnsupportedPlatform)
         }
+    }
+
+    /// Accepts every caller, so a composed adapter can serve a real call.
+    struct OneOwner(OwnerToken);
+
+    impl AddressOwnerResolver for OneOwner {
+        fn owner_for_address(&self, _address: NonZeroUsize) -> Option<OwnerToken> {
+            Some(self.0)
+        }
+
+        fn is_current_owner(&self, _owner: OwnerToken) -> bool {
+            true
+        }
+    }
+
+    struct NoGameMessages;
+
+    impl GameOnlyMessageSink for NoGameMessages {
+        fn send_to_game_only(
+            &self,
+            _message: u32,
+            _w_param: usize,
+            _l_param: isize,
+        ) -> Result<(), GameSinkError> {
+            Ok(())
+        }
+    }
+
+    struct NoTextures;
+
+    impl TextureServiceFacade for NoTextures {
+        fn get(&self, _identifier: &str) -> Result<Option<TextureHandle>, TextureFacadeError> {
+            Ok(None)
+        }
+
+        fn load_with_source(
+            &self,
+            _identifier: &str,
+            _options: LoadOptions,
+            _callback: Option<TextureCallback>,
+            _source: TextureSourceFactory<'_>,
+            _failure_policy: TextureSourceFailurePolicy,
+        ) -> Result<RequestOutcome, TextureFacadeError> {
+            Err(TextureFacadeError::Rejected)
+        }
+
+        fn cleanup_owner_generation(
+            &self,
+            _owner: OwnerGeneration,
+        ) -> Result<usize, TextureFacadeError> {
+            Ok(0)
+        }
+    }
+
+    struct NoFonts;
+
+    impl RenderFontService for NoFonts {
+        fn get(
+            &self,
+            _owner: OwnerId,
+            _identifier: String,
+            _callback: SendFontCallback,
+        ) -> RequiredServiceResult<FontGetResult> {
+            Err(BackendOperationError::ServiceRejected)
+        }
+
+        fn release(
+            &self,
+            _identifier: String,
+            _subscription: SubscriptionId,
+        ) -> RequiredServiceResult<bool> {
+            Ok(false)
+        }
+
+        fn add_from_file(
+            &self,
+            _owner: OwnerId,
+            _identifier: String,
+            _size: f32,
+            _filename: PathBuf,
+            _callback: Option<SendFontCallback>,
+            _config: FontConfig,
+        ) -> RequiredServiceResult<FontRegistration> {
+            Err(BackendOperationError::ServiceRejected)
+        }
+
+        fn add_from_resource(
+            &self,
+            _owner: OwnerId,
+            _identifier: String,
+            _size: f32,
+            _resource: ResourceFont,
+            _callback: Option<SendFontCallback>,
+            _config: FontConfig,
+        ) -> RequiredServiceResult<FontRegistration> {
+            Err(BackendOperationError::ServiceRejected)
+        }
+
+        fn add_from_memory(
+            &self,
+            _owner: OwnerId,
+            _identifier: String,
+            _size: f32,
+            _data: Vec<u8>,
+            _callback: Option<SendFontCallback>,
+            _config: FontConfig,
+        ) -> RequiredServiceResult<FontRegistration> {
+            Err(BackendOperationError::ServiceRejected)
+        }
+
+        fn resize(&self, _identifier: String, _size: f32) -> RequiredServiceResult<bool> {
+            Ok(false)
+        }
+
+        fn cleanup_owner(&self, _owner: OwnerId) -> RequiredServiceResult<usize> {
+            Ok(0)
+        }
+
+        fn cleanup_owner_callbacks(&self, _owner: OwnerId) -> RequiredServiceResult<usize> {
+            Ok(0)
+        }
+
+        fn cleanup_owner_resources(&self, _owner: OwnerId) -> RequiredServiceResult<usize> {
+            Ok(0)
+        }
+    }
+
+    /// `compose` is the only place the thirteen adapters are wired, so a runtime cannot
+    /// half-install the API. This drives one real call through a fully composed backend:
+    /// before `compose` existed, `ProductionAddonApiBackend` had no non-test constructor at
+    /// all, so nothing proved the bundles could be built from the services a runtime owns.
+    #[test]
+    fn compose_builds_a_backend_that_serves_a_real_call() {
+        let owner = OwnerToken {
+            signature: 0x1234,
+            generation: 1,
+        };
+        let failures = Arc::new(BackendFailures::new());
+        let callers = Arc::new(AddonCallerResolver::new(Arc::new(OneOwner(owner))));
+        let boundary = Arc::new(NativeCallBoundary::new(
+            callers,
+            NativeMemoryReader::default(),
+            Arc::clone(&failures),
+        ));
+
+        let root = std::env::temp_dir().join("nexus-addon-backend-compose");
+        let path_index = PathIndex::prepare(PathRoots::new(
+            root.join("Nexus.dll"),
+            root.join("system"),
+            root.join("documents"),
+        ))
+        .expect("test paths should be representable");
+        let expected = path_index.get(PathKey::GameDirectory).to_path_buf();
+
+        let backend = ProductionAddonApiBackend::compose(
+            boundary,
+            failures,
+            AddonApiServices {
+                ui_host: Arc::new(UiHost::default()),
+                logs: Arc::new(LogRegistry::new()),
+                paths: Arc::new(
+                    StablePathStore::from_index(&path_index, 4)
+                        .expect("test paths should have no interior nul"),
+                ),
+                inline_hooks: Arc::new(InlineHookService::new()),
+                events: Arc::new(EventService::new()),
+                data_link: Arc::new(DataLinkService::new(Arc::new(RejectMappings))),
+                wnd_proc_callbacks: Arc::new(RawWndProcRegistry::new(CallbackLimits::default())),
+                game_messages: Arc::new(NoGameMessages),
+                input_binds: Arc::new(ManagedInputBinds::new(
+                    Arc::new(InlineExecutor),
+                    CallbackLimits::default(),
+                )),
+                game_invoker: Arc::new(Mutex::new(None)),
+                game_scheduler: None,
+                textures: Arc::new(NoTextures),
+                localization: Arc::new(Mutex::new(
+                    LocalizationService::new("en", 8).expect("test localization should start"),
+                )),
+                fonts: Arc::new(NoFonts),
+            },
+        );
+
+        // A path getter is the cheapest call that proves attribution, the boundary and a
+        // core adapter are all wired: the reference never returns null here.
+        let pointer = backend.paths_get_game_directory();
+        assert!(
+            !pointer.is_null(),
+            "a composed backend must serve the path getters"
+        );
+        // SAFETY: the pointer is process-lifetime storage owned by the composed backend.
+        let value = unsafe { CStr::from_ptr(pointer) };
+        assert_eq!(value.to_string_lossy(), expected.to_string_lossy());
     }
 
     fn unused_core() -> CoreAddonApiServices {
