@@ -308,6 +308,26 @@ populated.
 module through the lifecycle while publishing its address range into this same index. The API
 table is ready to receive them.
 
+**That step is wiring, not new components — every adapter it needs already exists in
+production form:**
+
+| `ManagerRuntime::new` parameter | Production implementation |
+|---|---|
+| `scanner: impl DirectoryScanner` | `StdDirectoryScanner` (`nexus-addon-manager/src/discovery.rs:160`) |
+| `platform: Arc<P: LoaderPlatform>` | `WindowsPlatform` (`nexus-addon-loader/src/windows.rs:100`) |
+| `resolver: impl ModuleAddressResolver<P>` | `LoadedModuleAddressResolver` (`nexus-addon-manager/src/manager.rs:219`), which reuses the loader's already-validated mapped-image bounds |
+| `cleaner: C: RegistrationCleaner` | the composite in `nexus-addon-cleanup/src/cleaner.rs:319` |
+
+plus `.with_address_ownership_index(...)` — which is precisely why the runtime owns the index
+— and `.with_api_tables(...)` from the installed session's catalog. `AddonManager::new` then
+takes the addon directory, an `AddonConfigDocument` (whose format is already golden-tested,
+#19), a `ConfigAccess` and `ManagerOptions`.
+
+The one genuinely new decision is **where activation runs**. Activation executes untrusted
+native code from disk, so it must happen on the render thread with the API table already
+installed, and it must respect the volatile/350-build rule (#8) and the config's
+enabled/disabled state (#19) before loading anything.
+
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
 half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and
