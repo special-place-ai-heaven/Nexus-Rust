@@ -231,6 +231,21 @@ then either execute inline through `FONT_SESSIONS` or enqueue an owned command w
 one-shot response and block until the render thread drains it at the top of `advance`, before
 `session.advance`.
 
+**The inline half is built.** `RuntimeFontCoordinator::with_active_manager` is the seam every
+add-on-facing font operation routes through. It revalidates the active session, the current
+ImGui context, the attachment and the failed flag immediately before execution; maps a failed
+`try_borrow_mut` to a closed `Reentrant` rejection; and on a contained panic marks the
+attachment failed rather than returning an ordinary rejection over a possible partial
+mutation. Its test covers the positive path against a real manager, re-entrancy, an off-thread
+call and a detached attachment, and is flip-tested — removing the `try_borrow_mut` guard makes
+the re-entrant case panic with `RefCell already borrowed`.
+
+Remaining for the bridge: the bounded queue (count **and** retained bytes), the ticket with
+its one-shot response, older-work-first draining at the top of `advance`, and the
+`RenderFontService` adapter that maps these closed errors onto the ABI's return values. The
+seam is deliberately `dead_code`-allowed until that adapter lands, because installing a
+partial bridge would hand add-ons a null `ImFont*`.
+
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
 half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and

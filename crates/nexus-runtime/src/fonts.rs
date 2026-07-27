@@ -246,6 +246,37 @@ enum UserFontLoadError {
     InvalidData(#[source] UserFontError),
 }
 
+/// Closed reasons an inline font operation could not run.
+///
+/// Every variant is atomic: no partial registration or mutation is observable through any
+/// of them, which is what lets the add-on-facing adapter map them straight onto the legacy
+/// ABI's closed return values.
+///
+/// Landed ahead of its consumer: the add-on-facing `RenderFontService` adapter that maps
+/// these onto the ABI's closed return values is the next checkpoint.
+#[allow(
+    dead_code,
+    reason = "consumed by the RenderFontService adapter, landing next"
+)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum RuntimeFontBridgeError {
+    /// No font session is attached on this thread.
+    #[error("no font render session is active on this thread")]
+    NoActiveSession,
+    /// The calling thread holds no current ImGui context.
+    #[error("no current ImGui context")]
+    NoImGuiContext,
+    /// The attachment or context changed after the call was accepted.
+    #[error("the font attachment was superseded")]
+    StaleAttachment,
+    /// A font callback re-entered while the manager was mutably borrowed.
+    #[error("the font manager is already borrowed by this thread")]
+    Reentrant,
+    /// The attachment was marked failed, so no further work may run against it.
+    #[error("the font attachment was marked failed")]
+    AttachmentFailed,
+}
+
 /// Process-owned facade whose native font manager remains render-thread local.
 pub(crate) struct RuntimeFontCoordinator {
     coordinator_id: u64,
@@ -451,6 +482,68 @@ impl RuntimeFontCoordinator {
                 active.attachment_id,
             ));
         }
+    }
+
+    /// Runs one font-manager operation inline on the render thread.
+    ///
+    /// This is the seam every add-on-facing font operation routes through. The manager is
+    /// **thread-local** to the render thread (`FONT_SESSIONS`), so a call arriving on any
+    /// other thread cannot reach it at all and must be queued by the caller instead — the
+    /// queue is structural, not an optimisation. See `CONFORMANCE.md` §2.9.
+    ///
+    /// The active session, the current ImGui context and the attachment are all revalidated
+    /// immediately before execution, exactly as [`Self::advance`] does, so work accepted
+    /// under an older render selection can never run in a new context.
+    ///
+    /// A failed `try_borrow_mut` means a re-entrant call arrived from inside a font
+    /// callback. That rejects closed rather than waiting or panicking, matching the
+    /// discipline `nexus-addon-cleanup` already uses for the two cleanup phases.
+    ///
+    /// A panic inside `operation` may have followed a partial mutation, which containment
+    /// alone cannot undo, so the attachment is marked failed rather than left active with an
+    /// ordinary rejection returned.
+    #[allow(
+        dead_code,
+        reason = "consumed by the RenderFontService adapter, landing next"
+    )]
+    pub(crate) fn with_active_manager<R>(
+        &self,
+        operation: impl FnOnce(&mut ImGuiFontManager) -> R,
+    ) -> Result<R, RuntimeFontBridgeError> {
+        let attachment_id = self
+            .active_attachment_on_current_thread()
+            .ok_or(RuntimeFontBridgeError::NoActiveSession)?;
+        let context = current_imgui_context().ok_or(RuntimeFontBridgeError::NoImGuiContext)?;
+
+        let mut outcome = None;
+        let contained = contain_font_operation(|| {
+            let _ = FONT_SESSIONS.try_with(|sessions| {
+                let Ok(mut sessions) = sessions.try_borrow_mut() else {
+                    outcome = Some(Err(RuntimeFontBridgeError::Reentrant));
+                    return;
+                };
+                let Some(session) = sessions.get_mut(&self.coordinator_id) else {
+                    outcome = Some(Err(RuntimeFontBridgeError::NoActiveSession));
+                    return;
+                };
+                if session.attachment_id != attachment_id || session.context != context {
+                    outcome = Some(Err(RuntimeFontBridgeError::StaleAttachment));
+                    return;
+                }
+                if session.failed {
+                    outcome = Some(Err(RuntimeFontBridgeError::AttachmentFailed));
+                    return;
+                }
+                outcome = Some(Ok(operation(&mut session.manager)));
+            });
+        });
+
+        if let Err(error) = contained {
+            self.mark_failed(attachment_id, context);
+            crate::diagnostics::report_proxy_failure(&error);
+            return Err(RuntimeFontBridgeError::AttachmentFailed);
+        }
+        outcome.unwrap_or(Err(RuntimeFontBridgeError::NoActiveSession))
     }
 
     fn active_attachment_on_current_thread(&self) -> Option<u64> {
@@ -702,8 +795,9 @@ mod tests {
 
     use super::{
         CombinedRenderSessionLease, FONT_SESSIONS, FontAddressCatalog, FontAddresses,
-        FontSessionIdentity, RuntimeFontCoordinator, contain_font_operation,
-        load_configured_user_font, validate_user_font_file_len, validate_user_font_name,
+        FontSessionIdentity, RuntimeFontBridgeError, RuntimeFontCoordinator,
+        contain_font_operation, load_configured_user_font, validate_user_font_file_len,
+        validate_user_font_name,
     };
 
     fn context_lock() -> MutexGuard<'static, ()> {
@@ -742,6 +836,62 @@ mod tests {
         assert!(!coordinator.take_gpu_rebuild(context.as_ptr(), RenderStage::Addons));
 
         drop(lease);
+        // SAFETY: the session lease dropped all TLS state before destruction.
+        unsafe { sys::igDestroyContext(context.as_ptr()) };
+    }
+
+    /// The seam every add-on-facing font operation routes through: it must reach the
+    /// thread-local manager on the render thread and reject closed everywhere else.
+    #[test]
+    fn the_inline_seam_reaches_the_manager_and_rejects_closed_off_thread() {
+        let _guard = context_lock();
+        // SAFETY: this test owns one current context on this thread.
+        let context = unsafe { sys::igCreateContext(core::ptr::null_mut()) };
+        let context = NonNull::new(context).expect("test context");
+        let coordinator = Arc::new(RuntimeFontCoordinator::default());
+
+        // Before any attachment there is no session to run against.
+        assert_eq!(
+            coordinator.with_active_manager(|_manager| ()),
+            Err(RuntimeFontBridgeError::NoActiveSession)
+        );
+
+        let lease = coordinator
+            .attach_session(identity(1), context)
+            .expect("font session");
+        coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+
+        // On the render thread the operation runs against the real manager and its return
+        // value comes back synchronously.
+        let removed = coordinator
+            .with_active_manager(|manager| manager.cleanup_owner_callbacks(OwnerId::new(9, 1)))
+            .expect("the render thread must reach the manager");
+        assert_eq!(removed, 0);
+
+        // A re-entrant call from inside an operation must reject closed rather than
+        // deadlock on itself or panic.
+        let reentrant = coordinator
+            .with_active_manager(|_manager| coordinator.with_active_manager(|_inner| ()))
+            .expect("the outer call still runs");
+        assert_eq!(reentrant, Err(RuntimeFontBridgeError::Reentrant));
+
+        // The manager is thread-local, so another thread cannot reach it at all. This is
+        // why the off-thread path must queue rather than borrow.
+        let foreign = Arc::clone(&coordinator);
+        let from_other_thread = std::thread::spawn(move || foreign.with_active_manager(|_m| ()))
+            .join()
+            .expect("the probe thread must not panic");
+        assert_eq!(
+            from_other_thread,
+            Err(RuntimeFontBridgeError::NoActiveSession)
+        );
+
+        drop(lease);
+        // A detached attachment must not keep serving work.
+        assert_eq!(
+            coordinator.with_active_manager(|_manager| ()),
+            Err(RuntimeFontBridgeError::NoActiveSession)
+        );
         // SAFETY: the session lease dropped all TLS state before destruction.
         unsafe { sys::igDestroyContext(context.as_ptr()) };
     }
