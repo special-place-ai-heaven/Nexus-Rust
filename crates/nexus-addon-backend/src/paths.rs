@@ -3,7 +3,10 @@ use core::fmt;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{self, AtomicU64},
+};
 
 use nexus_platform::{PathIndex, PathKey};
 use thiserror::Error;
@@ -16,8 +19,10 @@ pub struct StablePathStore {
     addons: CString,
     common: CString,
     addons_path: PathBuf,
+    /// Advisory threshold; exceeding it is recorded, never refused.
     maximum_addon_paths: usize,
     addon_paths: Mutex<HashMap<OsString, Box<CString>>>,
+    over_threshold_interns: AtomicU64,
 }
 
 impl StablePathStore {
@@ -50,6 +55,7 @@ impl StablePathStore {
             addons_path: addons.to_path_buf(),
             maximum_addon_paths,
             addon_paths: Mutex::new(HashMap::new()),
+            over_threshold_interns: AtomicU64::new(0),
         })
     }
 
@@ -76,16 +82,31 @@ impl StablePathStore {
         if let Some(path) = paths.get(&key) {
             return Ok(path.as_ptr());
         }
-        if paths.len() >= self.maximum_addon_paths {
-            return Err(StablePathError::CapacityExceeded);
-        }
+        // The ceiling is a diagnostic threshold, not a rejection. The reference has no
+        // ceiling and no failure path here: every call returns a valid NUL-terminated
+        // pointer valid for the process lifetime (`ApiBuilder.cpp:175-215`). Refusing
+        // instead hands an add-on a null pointer that it concatenates onto its own path,
+        // which is a crash rather than a degraded result. Interning past the threshold
+        // costs one path per distinct name — exactly the reference's growth — and is
+        // strictly preferable to that.
+        let over_threshold = paths.len() >= self.maximum_addon_paths;
         paths
             .try_reserve(1)
             .map_err(|_error| StablePathError::AllocationFailed)?;
         let path = Box::new(path_to_c_string(&self.addons_path.join(&key))?);
         let address = path.as_ptr();
         paths.insert(key, path);
+        if over_threshold {
+            self.over_threshold_interns
+                .fetch_add(1, atomic::Ordering::Relaxed);
+        }
         Ok(address)
+    }
+
+    /// Number of names interned past the advisory ceiling. Diagnostics only.
+    #[must_use]
+    pub fn over_threshold_interns(&self) -> u64 {
+        self.over_threshold_interns.load(atomic::Ordering::Relaxed)
     }
 
     /// Returns the number of interned non-empty add-on names.
@@ -172,9 +193,6 @@ pub enum StablePathError {
     /// A native path contained an interior NUL byte.
     #[error("native path cannot be represented as a C string")]
     InteriorNul,
-    /// The configured number of unique add-on paths has been reached.
-    #[error("stable path capacity was reached")]
-    CapacityExceeded,
     /// The path registry could not reserve another entry.
     #[error("stable path allocation failed")]
     AllocationFailed,
@@ -225,21 +243,36 @@ mod tests {
         );
     }
 
+    /// The reference has no ceiling and no failure path for the directory getters, and an
+    /// add-on concatenates whatever it is handed. Past the advisory threshold a name must
+    /// therefore still intern to a valid, stable pointer rather than being refused.
     #[test]
-    fn empty_name_uses_root_and_capacity_fails_without_eviction() {
+    fn the_capacity_threshold_records_rather_than_refuses() {
         let paths = store(1);
         assert_eq!(
             paths.addon_directory("").expect("root"),
             paths.addons.as_ptr()
         );
         let retained = paths.addon_directory("retained").expect("retained");
-        assert_eq!(
-            paths.addon_directory("second"),
-            Err(StablePathError::CapacityExceeded)
-        );
+        assert_eq!(paths.over_threshold_interns(), 0);
+
+        let beyond = paths
+            .addon_directory("second")
+            .expect("a name past the threshold must still resolve, never return null");
+        assert!(!beyond.is_null());
+        assert_ne!(beyond, retained);
+        assert_eq!(paths.over_threshold_interns(), 1);
+
+        // Interning past the threshold must not evict or move an earlier pointer.
         assert_eq!(
             paths.addon_directory("retained").expect("still retained"),
             retained
+        );
+        // SAFETY: `beyond` points into boxed storage retained by `paths`.
+        let value = unsafe { CStr::from_ptr(beyond) };
+        assert_eq!(
+            value.to_string_lossy(),
+            Path::new("C:/game/addons").join("second").to_string_lossy()
         );
     }
 
