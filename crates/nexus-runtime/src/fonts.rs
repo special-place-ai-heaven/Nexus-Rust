@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::File;
@@ -9,8 +9,9 @@ use std::io::{self, Read};
 use std::path::{Component, Path};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
 use nexus_dxgi::RenderCallbackError;
@@ -103,6 +104,97 @@ struct FontCoordinatorState {
     next_attachment_id: u64,
     active: Option<ActiveFontSession>,
     stopped: bool,
+    /// Commands accepted off the render thread, in strict FIFO order.
+    queue: VecDeque<PendingFontCommand>,
+    /// Bytes retained by queued commands.
+    ///
+    /// A count limit alone is not a memory limit: a few hundred commands each carrying a
+    /// font file would retain gigabytes, and `FontManager::register_memory` copies the
+    /// bytes it is given.
+    queued_bytes: usize,
+}
+
+/// Bounds on work accepted off the render thread.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FontQueueLimits {
+    /// Maximum number of queued commands.
+    pub(crate) commands: usize,
+    /// Maximum total bytes retained by queued commands.
+    pub(crate) bytes: usize,
+}
+
+impl Default for FontQueueLimits {
+    fn default() -> Self {
+        Self {
+            commands: 256,
+            bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+/// One owned unit of font work accepted off the render thread.
+///
+/// The closure carries its own arguments and writes its typed result into the slot the
+/// caller is waiting on, so the queue itself stays untyped while every command remains
+/// fully owned — it retains no path, borrowed buffer, module handle or resource pointer.
+struct PendingFontCommand {
+    /// Attachment that accepted the command. Work accepted under an older render
+    /// selection must never execute in a new ImGui context.
+    attachment_id: u64,
+    retained_bytes: usize,
+    ticket: Arc<FontTicket>,
+    run: Box<dyn FnOnce(&mut ImGuiFontManager) + Send>,
+}
+
+/// Terminal state of one queued command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FontTicketState {
+    /// Waiting for the render thread.
+    Queued,
+    /// Rejected without executing; the reason is in the caller's slot.
+    Canceled,
+    /// Executed to completion.
+    Completed,
+}
+
+/// One-shot completion signal for a queued command.
+struct FontTicket {
+    state: Mutex<FontTicketState>,
+    settled: Condvar,
+}
+
+impl FontTicket {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(FontTicketState::Queued),
+            settled: Condvar::new(),
+        }
+    }
+
+    fn settle(&self, state: FontTicketState) {
+        *mutex_lock(&self.state) = state;
+        self.settled.notify_all();
+    }
+
+    /// Blocks until the render thread settles this command.
+    fn wait(&self, timeout: Duration) -> FontTicketState {
+        let deadline = Instant::now() + timeout;
+        let mut state = mutex_lock(&self.state);
+        while *state == FontTicketState::Queued {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.settled.wait_timeout(state, remaining) {
+                Ok((next, _timeout)) => state = next,
+                Err(poisoned) => {
+                    let (next, _timeout) = poisoned.into_inner();
+                    state = next;
+                }
+            }
+        }
+        *state
+    }
 }
 
 struct FontSession {
@@ -275,6 +367,12 @@ pub(crate) enum RuntimeFontBridgeError {
     /// The attachment was marked failed, so no further work may run against it.
     #[error("the font attachment was marked failed")]
     AttachmentFailed,
+    /// The bounded queue is at its command or byte limit.
+    #[error("the font command queue is full")]
+    QueueFull,
+    /// The render thread did not drain the command before the deadline.
+    #[error("the font command timed out before the render thread drained it")]
+    Timeout,
 }
 
 /// Process-owned facade whose native font manager remains render-thread local.
@@ -389,6 +487,9 @@ impl RuntimeFontCoordinator {
                 if session.attachment_id != attachment_id || session.context != context {
                     return;
                 }
+                // Queued work drains first, so global ordering stays FIFO and an add-on's
+                // registration is visible to the atlas rebuild in this same frame.
+                self.drain_queue(attachment_id, &mut session.manager);
                 session.advance(localization_changed, &localized_texts);
             });
         });
@@ -474,6 +575,9 @@ impl RuntimeFontCoordinator {
             state.stopped = true;
             state.active.take()
         };
+        // Release every waiter immediately. Leaving them blocked to their own deadlines
+        // would stall shutdown by exactly that timeout for no purpose.
+        self.cancel_all_queued();
         if let Some(active) = active
             && active.render_thread == std::thread::current().id()
         {
@@ -546,6 +650,126 @@ impl RuntimeFontCoordinator {
         outcome.unwrap_or(Err(RuntimeFontBridgeError::NoActiveSession))
     }
 
+    /// Accepts one command from a thread that is not the render thread and waits for it.
+    ///
+    /// The manager is thread-local to the render thread, so an off-thread caller cannot
+    /// execute the operation itself; queue-and-wait is the only way such a call can be
+    /// synchronous, which the native API requires. See `CONFORMANCE.md` §2.9.
+    ///
+    /// Rejection is atomic: a command that cannot be accepted never runs, and one that is
+    /// canceled after acceptance never partially mutated the manager.
+    #[allow(
+        dead_code,
+        reason = "consumed by the RenderFontService adapter, landing next"
+    )]
+    pub(crate) fn enqueue_for_render_thread<T: Send + 'static>(
+        &self,
+        retained_bytes: usize,
+        limits: FontQueueLimits,
+        timeout: Duration,
+        operation: impl FnOnce(&mut ImGuiFontManager) -> T + Send + 'static,
+    ) -> Result<T, RuntimeFontBridgeError> {
+        let slot = Arc::new(Mutex::new(None::<T>));
+        let ticket = Arc::new(FontTicket::new());
+
+        {
+            let mut state = mutex_lock(&self.state);
+            if state.stopped {
+                return Err(RuntimeFontBridgeError::NoActiveSession);
+            }
+            let attachment_id = state
+                .active
+                .map(|active| active.attachment_id)
+                .ok_or(RuntimeFontBridgeError::NoActiveSession)?;
+            if state.queue.len() >= limits.commands
+                || state.queued_bytes.saturating_add(retained_bytes) > limits.bytes
+            {
+                return Err(RuntimeFontBridgeError::QueueFull);
+            }
+            state.queued_bytes = state.queued_bytes.saturating_add(retained_bytes);
+
+            let command_slot = Arc::clone(&slot);
+            let command_ticket = Arc::clone(&ticket);
+            state.queue.push_back(PendingFontCommand {
+                attachment_id,
+                retained_bytes,
+                ticket: command_ticket,
+                run: Box::new(move |manager| {
+                    *mutex_lock(&command_slot) = Some(operation(manager));
+                }),
+            });
+        }
+
+        match ticket.wait(timeout) {
+            FontTicketState::Completed => mutex_lock(&slot)
+                .take()
+                .ok_or(RuntimeFontBridgeError::AttachmentFailed),
+            FontTicketState::Canceled => Err(RuntimeFontBridgeError::StaleAttachment),
+            // A command still queued at the deadline is canceled so it can never execute
+            // later against a caller that has already given up on it.
+            FontTicketState::Queued => {
+                self.cancel_queued(&ticket);
+                Err(RuntimeFontBridgeError::Timeout)
+            }
+        }
+    }
+
+    /// Removes one still-queued command, releasing its retained bytes.
+    fn cancel_queued(&self, ticket: &Arc<FontTicket>) {
+        let mut state = mutex_lock(&self.state);
+        if let Some(index) = state
+            .queue
+            .iter()
+            .position(|command| Arc::ptr_eq(&command.ticket, ticket))
+            && let Some(command) = state.queue.remove(index)
+        {
+            state.queued_bytes = state.queued_bytes.saturating_sub(command.retained_bytes);
+            command.ticket.settle(FontTicketState::Canceled);
+        }
+    }
+
+    /// Executes queued work for `attachment_id` in FIFO order, on the render thread.
+    ///
+    /// Commands accepted by a superseded attachment are canceled rather than executed, so
+    /// work can never run in an ImGui context it was not accepted under. Returns the number
+    /// of commands settled, for tests and diagnostics.
+    fn drain_queue(&self, attachment_id: u64, manager: &mut ImGuiFontManager) -> usize {
+        let mut settled = 0;
+        loop {
+            let command = {
+                let mut state = mutex_lock(&self.state);
+                match state.queue.pop_front() {
+                    Some(command) => {
+                        state.queued_bytes =
+                            state.queued_bytes.saturating_sub(command.retained_bytes);
+                        command
+                    }
+                    None => break,
+                }
+            };
+            if command.attachment_id == attachment_id {
+                (command.run)(manager);
+                command.ticket.settle(FontTicketState::Completed);
+            } else {
+                command.ticket.settle(FontTicketState::Canceled);
+            }
+            settled += 1;
+        }
+        settled
+    }
+
+    /// Cancels every queued command, releasing all retained bytes.
+    fn cancel_all_queued(&self) {
+        let (queued, _bytes) = {
+            let mut state = mutex_lock(&self.state);
+            state.queued_bytes = 0;
+            (state.queue.drain(..).collect::<Vec<_>>(), ())
+        };
+        for command in queued {
+            command.ticket.settle(FontTicketState::Canceled);
+        }
+    }
+
     fn active_attachment_on_current_thread(&self) -> Option<u64> {
         let state = mutex_lock(&self.state);
         if state.stopped {
@@ -563,6 +787,9 @@ impl RuntimeFontCoordinator {
                 state.active = None;
             }
         }
+        // Nothing will drain these now, and they were accepted by an attachment that no
+        // longer exists, so they must be canceled rather than left to time out.
+        self.cancel_all_queued();
         drop_font_session(take_thread_session(self.coordinator_id, attachment_id));
     }
 
@@ -787,6 +1014,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::Duration;
 
     use nexus_imgui_compat::sys;
     use nexus_render::{RenderStage, SwapChainId};
@@ -795,8 +1023,8 @@ mod tests {
 
     use super::{
         CombinedRenderSessionLease, FONT_SESSIONS, FontAddressCatalog, FontAddresses,
-        FontSessionIdentity, RuntimeFontBridgeError, RuntimeFontCoordinator,
-        contain_font_operation, load_configured_user_font, validate_user_font_file_len,
+        FontQueueLimits, FontSessionIdentity, RuntimeFontBridgeError, RuntimeFontCoordinator,
+        contain_font_operation, load_configured_user_font, mutex_lock, validate_user_font_file_len,
         validate_user_font_name,
     };
 
@@ -892,6 +1120,87 @@ mod tests {
             coordinator.with_active_manager(|_manager| ()),
             Err(RuntimeFontBridgeError::NoActiveSession)
         );
+        // SAFETY: the session lease dropped all TLS state before destruction.
+        unsafe { sys::igDestroyContext(context.as_ptr()) };
+    }
+
+    /// An off-thread call must complete synchronously by being drained on the render
+    /// thread, and must be bounded and cancelable rather than able to wait forever.
+    #[test]
+    fn queued_font_work_completes_on_the_render_thread_and_is_bounded() {
+        let _guard = context_lock();
+        // SAFETY: this test owns one current context on this thread.
+        let context = unsafe { sys::igCreateContext(core::ptr::null_mut()) };
+        let context = NonNull::new(context).expect("test context");
+        let coordinator = Arc::new(RuntimeFontCoordinator::default());
+        let lease = coordinator
+            .attach_session(identity(1), context)
+            .expect("font session");
+        coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+
+        // A queued command runs only when the render thread drains it, and its return
+        // value reaches the waiting caller.
+        let worker = Arc::clone(&coordinator);
+        let waiting = std::thread::spawn(move || {
+            worker.enqueue_for_render_thread(
+                0,
+                FontQueueLimits::default(),
+                Duration::from_secs(5),
+                |manager| manager.cleanup_owner_callbacks(OwnerId::new(11, 1)),
+            )
+        });
+
+        // Drain from the render thread until the waiter is served.
+        let mut served = None;
+        for _ in 0..200 {
+            coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+            if waiting.is_finished() {
+                served = Some(waiting.join().expect("waiter must not panic"));
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            served.expect("the render thread must serve the queued command"),
+            Ok(0)
+        );
+
+        // The byte bound rejects before accepting, so nothing is retained.
+        let bounded = FontQueueLimits {
+            commands: 8,
+            bytes: 16,
+        };
+        let worker = Arc::clone(&coordinator);
+        let refused = std::thread::spawn(move || {
+            worker.enqueue_for_render_thread(17, bounded, Duration::from_secs(5), |_manager| ())
+        })
+        .join()
+        .expect("waiter must not panic");
+        assert_eq!(refused, Err(RuntimeFontBridgeError::QueueFull));
+
+        // Detaching cancels queued work instead of leaving a caller blocked.
+        let worker = Arc::clone(&coordinator);
+        let canceled = std::thread::spawn(move || {
+            worker.enqueue_for_render_thread(
+                0,
+                FontQueueLimits::default(),
+                Duration::from_secs(5),
+                |_manager| (),
+            )
+        });
+        // Give the command time to land in the queue before detaching.
+        for _ in 0..1000 {
+            if mutex_lock(&coordinator.state).queue.len() == 1 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        drop(lease);
+        assert_eq!(
+            canceled.join().expect("waiter must not panic"),
+            Err(RuntimeFontBridgeError::StaleAttachment)
+        );
+
         // SAFETY: the session lease dropped all TLS state before destruction.
         unsafe { sys::igDestroyContext(context.as_ptr()) };
     }

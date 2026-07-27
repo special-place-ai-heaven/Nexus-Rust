@@ -240,11 +240,23 @@ mutation. Its test covers the positive path against a real manager, re-entrancy,
 call and a detached attachment, and is flip-tested — removing the `try_borrow_mut` guard makes
 the re-entrant case panic with `RefCell already borrowed`.
 
-Remaining for the bridge: the bounded queue (count **and** retained bytes), the ticket with
-its one-shot response, older-work-first draining at the top of `advance`, and the
-`RenderFontService` adapter that maps these closed errors onto the ABI's return values. The
-seam is deliberately `dead_code`-allowed until that adapter lands, because installing a
-partial bridge would hand add-ons a null `ImFont*`.
+**The queue is built too.** `enqueue_for_render_thread` accepts an owned command from any
+other thread and blocks until the render thread settles it, so an off-thread call is still
+synchronous from the native API's perspective. It is bounded on **both** command count (256)
+and retained bytes (32 MiB), because a count limit alone is not a memory limit —
+`FontManager::register_memory` copies the bytes it is given, so a few hundred queued font
+files would retain gigabytes. Each command carries the attachment that accepted it and is
+canceled rather than executed if that attachment has been superseded, so work can never run
+in an ImGui context it was not accepted under. `advance` drains the queue **before**
+`session.advance`, keeping global order FIFO and making a registration visible to the same
+frame's atlas rebuild. Detach and shutdown cancel every waiter immediately instead of leaving
+callers blocked to their own deadlines.
+
+Remaining for the bridge: the `RenderFontService` adapter that chooses inline versus queued
+by thread, copies file and Windows-resource bytes into an owned command before queueing, and
+maps these closed errors onto the ABI's return values. The seam and queue carry an explicit
+`dead_code` allowance until then, because installing a partial bridge would hand add-ons a
+null `ImFont*`.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
