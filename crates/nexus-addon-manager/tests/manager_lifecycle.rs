@@ -557,7 +557,14 @@ fn watcher_is_inert_and_full_lifecycle_drains_before_release() {
     manager
         .request_unload(owner, UnloadReason::Runtime)
         .expect("unload should close ingress");
-    assert!(!ownership.is_current_owner(owner));
+    // Addon-to-host API admission must survive until the native unload export has
+    // returned. The reference invokes that export with the whole API still live, and a
+    // real unload routine calls back in to deregister callbacks and ask for its addon
+    // directory; closing admission here returns a null pointer that addons concatenate.
+    assert!(
+        ownership.is_current_owner(owner),
+        "the API must stay live for an unload export"
+    );
     assert_eq!(ownership.owner_for_address(fixture.probe), Some(owner));
     assert!(matches!(
         manager.drain(owner, Duration::ZERO),
@@ -569,6 +576,11 @@ fn watcher_is_inert_and_full_lifecycle_drains_before_release() {
         .expect("drain retry should complete");
     // SAFETY: the injected unload callback only records an event.
     unsafe { manager.invoke_native_unload(owner) }.expect("native unload should work");
+    // Only now, with the export returned, may admission close.
+    assert!(
+        !ownership.is_current_owner(owner),
+        "admission must close once the unload export has returned"
+    );
     manager.finish_unload(owner).expect("release should work");
 
     assert_eq!(manager.owner_for_address(fixture.probe), None);

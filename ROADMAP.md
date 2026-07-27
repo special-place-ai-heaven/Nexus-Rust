@@ -136,7 +136,7 @@ wants one owner rather than a fan-out.
 Settle **first**, before writing lifecycle code:
 
 1. ~~`#20` texture registry lifetime~~ — **settled** in `CONFORMANCE.md` §2.6: records and the identifier map are process-lifetime, the SRV is per-device. Implementation outstanding.
-2. `#4` teardown order — native unload first, API fully live, sweep after.
+2. `#4` teardown order — **API-live half done** (§2.7, flip-tested); the sweep still precedes the export and is a separate checkpoint.
 3. `#54` load order — filesystem-inline vs sorted-batch, recorded as a decision with a test.
 
 Then, in order:

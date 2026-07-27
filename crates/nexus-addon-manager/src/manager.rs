@@ -1190,7 +1190,13 @@ impl<P: LoaderPlatform, C: RegistrationCleaner> AddonManager<P, C> {
             })?
             .request_shutdown()?;
         self.entry_mut(&key)?.state = ManagerState::UnloadRequested;
-        self.ownership.close(owner);
+        // Addon-to-host API admission deliberately stays open here. The reference
+        // invokes the addon's unload export while the whole API is still functional for
+        // it (`src/Host/Addons/Addon.cpp:418-432`), and real unload routines call back in
+        // to deregister callbacks, release textures and ask for their addon directory.
+        // Closing admission now makes `GetAddonDirectory` hand back a null pointer that
+        // addons concatenate, which is a crash rather than a no-op. Admission is closed
+        // in `invoke_native_unload`, once that export has returned.
         self.emit(
             DiagnosticSeverity::Info,
             DiagnosticCode::UnloadRequested,
@@ -1282,6 +1288,10 @@ impl<P: LoaderPlatform, C: RegistrationCleaner> AddonManager<P, C> {
             // groups completed their explicit drain before this transition.
             unsafe { module.invoke_unload() }
         };
+        // The export has returned, so no further addon-to-host call can originate from
+        // it. Close admission now rather than before the call, matching the reference's
+        // order of unload-then-sweep.
+        self.ownership.close(owner);
         self.entry_mut(&key)?.state = ManagerState::NativeUnloadComplete;
         self.emit(
             if result.is_ok() {

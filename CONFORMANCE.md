@@ -112,6 +112,32 @@ Some differences are mandatory. Reverting them in the name of compatibility caus
 Low-risk deliberate divergences worth recording rather than reverting: the network cache
 key, `User-Agent: Nexus/1.0`, and the finite 15/15/30/30s WinHTTP timeouts.
 
+### 2.7 Teardown order: the API stays live across the unload export
+
+The reference invokes the addon's unload export **first**, with the whole API functional for
+that addon, and only then sweeps host-side references and frees the module
+(`src/Host/Addons/Addon.cpp:418-432`: `Unload()` → `CleanupRefs` → `EV_ADDON_UNLOADED` →
+`FreeLibrary`). Real unload routines rely on this: they deregister callbacks, release
+textures and ask for their addon directory.
+
+`HANDOFF.md:654-665` prescribes the inverse, and the implementation followed it, so
+`request_unload` closed API admission before the export ran. A string getter then returned
+null, and addons concatenate that — a crash, not a no-op.
+
+**Fixed:** admission now closes inside `invoke_native_unload`, after the export returns.
+Note this is distinct from the *loader* gate, which `request_shutdown` closes immediately and
+should: that gate stops the host calling **into** the addon, which is correct while it tears
+down, whereas admission governs the addon calling **out** to the host.
+
+**Outstanding:** the host-side registration sweep (`drain_registrations`) still runs before
+the export instead of after. The observable difference is narrow — an addon deregistering
+something already swept gets a void no-op either way — but a registration *created* during
+unload would survive where the reference sweeps it, leaving a callback that can fire after
+`FreeLibrary`. The fix has a natural seam: `Module::complete_host_cleanup` already requires
+`UnloadCallbackComplete` and takes a closure, and is currently invoked with a no-op. Moving
+the sweep there needs a timeout parameter on `finish_unload`, which is why it is a separate
+checkpoint.
+
 ### 2.6 Settled: texture records are process-lifetime, GPU views are not
 
 `ROADMAP.md` requires this decided **before** the addon API is wired, because if ABI
@@ -471,7 +497,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 | 1 | ● | unreachable | **Zero addons load.** No scan, no DLL loaded, no load callback, no API table | `HoContext.cpp:64-70`, `Loader.cpp:252-255,389-410` | `nexus-runtime/Cargo.toml:16` depends only on `nexus-addon-backend` — not on `-ffi`/`-loader`/`-manager`/`-watch`/`-cleanup`/`nexus-host`. **Verified.** Root cause of ~20 other `unreachable` items |
 | 2 | ● | diverges | Overlay attaches; must not require a window-class literal | Class-agnostic: `Hooks.cpp:232-242`, `PlContext.cpp:34-56`. `ArenaNet_Dx_Window_Class` appears **nowhere** in the C++ tree (verified) | `dxgi.rs:31` + `set_require_expected_game_window(true)`; rejections at `classifier.rs:46-49,98-106` |
 | 3 | ● | matches | Byte layout of every addon-facing structure: API tables v1-v6, AddonDefinition, Version, InputBind, Texture, Mumble data/context/identity, NexusLink | `ApiV1.h`–`ApiV6.h`, `AddonDefV1.h:28-44` | **Revision 6 now externally verified** by `xtask verify-abi`: MSVC checks 60 facts against the vendored MIT header (§4.A4). v1–v5 are absent from the public header and remain author-computed; upstream `NexusLinkData_t` stops at `FontUI` so its quick-access tail is likewise unverified |
-| 4 | ● | diverges | An addon's unload routine can still call every API it used at load | `Addon.cpp:418-432`: native unload runs **first**, with the API fully live; sweep after | `manager.rs:1193,1203-1253,1263-1296` inverts it. `GetAddonDirectory` returns NULL and addons concatenate it — a crash vector. `HANDOFF.md:654-665` prescribes the *inverted* order |
+| 4 | ● | partial | An addon's unload routine can still call every API function it used during load | Order is: invoke the addon's unload export while the complete API is functional for it, then sweep host-side registrations pointing into the module, then release it (`Addon.cpp:418-432`) | **The crash vector is fixed.** `request_unload` no longer closes addon-to-host API admission; `invoke_native_unload` closes it once the export has returned, so `GetAddonDirectory` no longer hands back a null pointer that addons concatenate. Flip-tested. **Still diverging:** the host-side registration sweep still runs *before* the unload export rather than after, so a registration an addon creates during its own unload would survive where the reference sweeps it — see §2.7 |
 | 5 | ● | diverges | API calls work from any thread and any call stack | No caller authentication; attribution failure never denies (`ApiBuilder.cpp:173-215`) | `boundary.rs:147-162` fails closed; `dispatcher.rs:295-308` returns null. Breaks worker threads, timer callbacks, MinHook trampolines |
 | 6 | ● | diverges | Non-UTF-8 / long / heap-allocated addon metadata still loads | Opaque NUL-terminated bytes; no provenance check | `definition.rs:430` rejects invalid UTF-8; ceilings reject rather than truncate; `module.rs:312-361` rejects out-of-image definitions |
 | 7 | ● | diverges | A symlinked DLL loads; one locked file doesn't disable every addon | Symlinks resolved; one bad entry skipped, never fatal | `discovery.rs:171-173` skips symlinks; `:161-195` returns `Err` for the whole scan, discarding every entry already found |
