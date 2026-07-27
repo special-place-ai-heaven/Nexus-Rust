@@ -185,11 +185,28 @@ to composition:
 | `Arc<dyn RenderFontService>` | **absent, and this is the real blocker** |
 
 `RuntimeFontCoordinator` exposes only render-side operations — `advance`,
-`take_gpu_rebuild`, `selected_addresses`, `active_identity`, `shutdown` — over
-`ImGuiFontManager`. It has no `get`, `add_from_*`, `release` or `resize`, so the
+`take_gpu_rebuild`, `selected_addresses`, `active_identity`, `shutdown` — so the
 addon-facing font surface does not exist in the runtime at all, and it is not merely
 unwired. That is `HANDOFF.md`'s second milestone (the bounded synchronous render-font
 bridge, specified at `HANDOFF.md:351-535`).
+
+**But the milestone is smaller than that specification implies, which is worth knowing
+before anyone starts it.** `ImGuiFontManager` is `FontManager<ImGuiFontAtlasBackend>`
+(`nexus-ui-fonts/src/lib.rs:593`), and `FontManager` already implements every addon-facing
+operation the trait needs: `get`, `register_memory`, `release`, `resize`, `cleanup_owner`,
+`cleanup_owner_callbacks` and `cleanup_owner_resources`
+(`nexus-ui-services/src/fonts.rs:410-687`). `FontSession` already owns one such manager per
+attachment (`nexus-runtime/src/fonts.rs:108-116`).
+
+So the bridge is **routing, not reimplementation**: the work is the bounded FIFO, the ticket
+and one-shot response, inline-versus-queued dispatch with older-work-first draining,
+re-validating the attachment immediately before execution, and the transactional
+partial-mutation failure path. None of the font operations themselves need writing.
+
+The borrow discipline also has precedent to copy rather than invent:
+`nexus-addon-cleanup/src/direct.rs:105-116` already routes the two cleanup phases through
+`try_borrow_mut` and maps a failed borrow to a closed `Busy` rejection, which is exactly the
+re-entrancy rule the specification demands.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
