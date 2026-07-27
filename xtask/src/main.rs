@@ -160,11 +160,28 @@ fn smoke_proxy(path: &Path) -> Result<String, String> {
     let absolute = path
         .canonicalize()
         .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
+
+    // The reference deliberately has no DllMain, deferring every side effect to a latch
+    // on the first proxy export, because LoadLibrary, CreateWindow and hook installation
+    // all deadlock under the loader lock. Assert the image cannot run code at load time
+    // before proving it behaves that way.
+    let image = fs::read(&absolute)
+        .map_err(|error| format!("failed to read {}: {error}", absolute.display()))?;
+    verify_tls_callbacks(&image)?;
+
     let wide = absolute
         .as_os_str()
         .encode_wide()
         .chain(core::iter::once(0))
         .collect::<Vec<_>>();
+
+    // The runtime anchors its path index on the executable's directory, so watch there.
+    let beside = env::current_exe()
+        .map_err(|error| format!("failed to locate the running executable: {error}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "the running executable has no parent directory".to_owned())?;
+    let before = ProcessFootprint::sample(&beside)?;
 
     // SAFETY: `wide` is NUL-terminated and alive for the duration of the call.
     let module = unsafe { LoadLibraryW(wide.as_ptr()) };
@@ -175,6 +192,9 @@ fn smoke_proxy(path: &Path) -> Result<String, String> {
             std::io::Error::last_os_error()
         ));
     }
+
+    let after = ProcessFootprint::sample(&beside)?;
+    before.assert_unchanged_by_load(&after)?;
 
     // SAFETY: `module` is live and the export name is static and NUL-terminated.
     let address = unsafe { GetProcAddress(module, c"D3DPERF_GetStatus".as_ptr().cast()) }
@@ -187,9 +207,153 @@ fn smoke_proxy(path: &Path) -> Result<String, String> {
     let status = unsafe { get_status() };
 
     Ok(format!(
-        "loaded {} and forwarded D3DPERF_GetStatus successfully (status {status})",
+        "loaded {} with no load-time side effects and forwarded D3DPERF_GetStatus \
+         successfully (status {status})",
         absolute.display()
     ))
+}
+
+/// Observable process state that loading the proxy must not disturb.
+///
+/// Deliberately does **not** count threads. `LoadLibrary` makes Windows start its own
+/// loader worker threads to initialise dependencies in parallel, so the process thread
+/// count rises for reasons that have nothing to do with the module under test — measured
+/// here as a +2 change for a proxy that runs no code at all. Attributing a thread to this
+/// module would mean querying each thread's Win32 start address and testing it against the
+/// module's address range; until that exists, a raw count is an instrument that fails on
+/// innocent input, which is worse than no instrument. The remaining checks are
+/// attributable: Windows does not create windows or files on our behalf.
+#[cfg(windows)]
+struct ProcessFootprint {
+    windows: usize,
+    addons_directory: bool,
+}
+
+#[cfg(windows)]
+impl ProcessFootprint {
+    fn sample(beside: &Path) -> Result<Self, String> {
+        Ok(Self {
+            windows: count_process_windows(),
+            addons_directory: beside.join("addons").exists(),
+        })
+    }
+
+    fn assert_unchanged_by_load(&self, after: &Self) -> Result<(), String> {
+        if after.windows != self.windows {
+            return Err(format!(
+                "loading the proxy created {} top-level window(s)\n\
+                 the reference creates none until its first proxy export runs, because \
+                 CreateWindow under the loader lock deadlocks",
+                after.windows.saturating_sub(self.windows)
+            ));
+        }
+        if after.addons_directory && !self.addons_directory {
+            return Err("loading the proxy created an `addons` directory\n\
+                 the reference touches no filesystem path until its first proxy export runs"
+                .into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn count_process_windows() -> usize {
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM},
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId},
+    };
+
+    // `BOOL` is an `i32` alias; WNDENUMPROC is satisfied by the concrete type.
+    unsafe extern "system" fn visit(window: HWND, counter: LPARAM) -> i32 {
+        let mut owner = 0;
+        // SAFETY: `window` comes from EnumWindows and `owner` is a live local.
+        unsafe { GetWindowThreadProcessId(window, &raw mut owner) };
+        // SAFETY: GetCurrentProcessId takes no arguments and cannot fail.
+        if owner == unsafe { GetCurrentProcessId() } {
+            let counter = counter as *mut usize;
+            // SAFETY: `counter` is the `&mut usize` the caller below passed through.
+            unsafe { *counter += 1 };
+        }
+        1
+    }
+
+    let mut windows: usize = 0;
+    let counter = (&raw mut windows) as LPARAM;
+    // SAFETY: `visit` matches WNDENUMPROC and `windows` outlives the call.
+    unsafe { EnumWindows(Some(visit), counter) };
+    windows
+}
+
+/// Rejects an image that registers a TLS callback beyond Rust's own.
+///
+/// Every Rust `cdylib` carries exactly one: the standard library's thread-local
+/// destructor hook, emitted into `.CRT$XLB` whether or not any `thread_local` exists.
+/// Requiring an *empty* array is therefore impossible to satisfy in Rust. What is
+/// meaningful is that nothing **additional** was registered, since an extra callback runs
+/// under the loader lock before any export.
+///
+/// Note the limit of this check: it cannot see a `thread_local` whose `Drop` takes a lock,
+/// which is the loader-lock deadlock actually worth fearing during `DLL_THREAD_DETACH`.
+/// Std's single hook services every thread-local, so the callback count does not move when
+/// one is added. That hazard is a source-level property and stays a review rule.
+fn verify_tls_callbacks(image: &[u8]) -> Result<(), String> {
+    let headers = read_pe_headers(image)?;
+    // The TLS directory is data-directory index 9, at 112 + 9 * 8 within the optional
+    // header. NumberOfRvaAndSizes must therefore exceed 9 for it to be present at all.
+    if read_u32(image, checked_add(headers.optional, 108)?)? < 10 {
+        return Ok(());
+    }
+    let directory = read_u32(image, checked_add(headers.optional, 184)?)?;
+    if directory == 0 {
+        return Ok(());
+    }
+
+    // IMAGE_TLS_DIRECTORY64 stores virtual addresses, not RVAs.
+    let image_base = read_u64(image, checked_add(headers.optional, 24)?)?;
+    let offset = rva_to_offset(directory, headers.size_of_headers, &headers.sections)?;
+    let callbacks = read_u64(image, checked_add(offset, 24)?)?;
+    if callbacks == 0 {
+        return Ok(());
+    }
+
+    let Some(callbacks_rva) = callbacks.checked_sub(image_base) else {
+        return Err("the TLS callback array lies below the image base".into());
+    };
+    let callbacks_rva =
+        u32::try_from(callbacks_rva).map_err(|_| "the TLS callback array RVA is too large")?;
+    let array = rva_to_offset(callbacks_rva, headers.size_of_headers, &headers.sections)?;
+
+    let mut registered = Vec::new();
+    loop {
+        let entry = read_u64(
+            image,
+            checked_add(array, checked_mul(registered.len(), 8)?)?,
+        )?;
+        if entry == 0 {
+            break;
+        }
+        registered.push(entry);
+        if registered.len() > 16 {
+            return Err("the TLS callback array is unterminated or implausibly long".into());
+        }
+    }
+
+    if registered.len() > 1 {
+        let extra = registered
+            .iter()
+            .map(|address| format!("{address:#x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "the image registers {} TLS callbacks ({extra})\n\
+             exactly one is expected: the Rust standard library's thread-local destructor \
+             hook. Anything further runs under the loader lock before any export, which is \
+             what the reference deliberately avoids by having no DllMain",
+            registered.len()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -619,6 +783,15 @@ fn read_u16(image: &[u8], offset: usize) -> Result<u16, String> {
     let array = <[u8; 2]>::try_from(bytes)
         .map_err(|_| format!("invalid 16-bit PE field at file offset 0x{offset:x}"))?;
     Ok(u16::from_le_bytes(array))
+}
+
+fn read_u64(image: &[u8], offset: usize) -> Result<u64, String> {
+    let bytes = image
+        .get(offset..offset.saturating_add(8))
+        .ok_or_else(|| format!("truncated PE field at file offset 0x{offset:x}"))?;
+    let array = <[u8; 8]>::try_from(bytes)
+        .map_err(|_| format!("invalid 64-bit PE field at file offset 0x{offset:x}"))?;
+    Ok(u64::from_le_bytes(array))
 }
 
 fn read_u32(image: &[u8], offset: usize) -> Result<u32, String> {

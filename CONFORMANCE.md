@@ -318,10 +318,26 @@ today), and compile-time asserts on the literal `"GetAddonDef"` and
 **A5. Export directory:** name == `d3d11.dll`, 20 non-forwarder exports, no duplicate
 ordinals, `AddressOfEntryPoint` not reaching Nexus code.
 
-**A6. TLS callbacks.** The image *has* a TLS directory (size 40), so this is live, not
-theoretical: assert `AddressOfCallBacks` is empty or holds only the known CRT callback,
-and forbid any `thread_local` with a non-trivial `Drop` in the DLL — a `Drop` taking a
-lock during `DLL_THREAD_DETACH` is a loader-lock deadlock in a live game.
+**A6. TLS callbacks and load-time purity. Status: closed, with one suggestion corrected.**
+`xtask smoke-proxy` now asserts, before calling any export, that the image registers no TLS
+callback beyond Rust's own and that loading it creates no window and no `addons` directory.
+CI runs it.
+
+**The original suggestion — "assert `AddressOfCallBacks` is empty" — is impossible to
+satisfy in Rust and was measured to be so.** Every Rust `cdylib` carries exactly one
+callback: the standard library's thread-local destructor hook, emitted into `.CRT$XLB`
+whether or not any `thread_local` exists. Our proxy has one at a fixed address. The gate
+therefore asserts *exactly one*, so nothing **additional** can be registered.
+
+**And the hazard that motivated it is not machine-checkable here.** A `thread_local` whose
+`Drop` takes a lock is a genuine loader-lock deadlock during `DLL_THREAD_DETACH` — but std's
+single hook services every thread-local, so the callback count does not move when one is
+added. That stays a **review rule**, not a gate. Recorded so nobody re-derives the check and
+concludes it covers the hazard.
+
+Flip-tested by splicing a second entry into the callback array (8 bytes changed): the gate
+reports `the image registers 2 TLS callbacks`. The window check was flip-tested against a
+fixture that calls `CreateWindowExW` in `DllMain`.
 
 ### B. Value tables and parser round-trips
 
@@ -357,8 +373,12 @@ A stub exe and stub DLLs. Still no GW2.
   per-export recursion scoping (#33).
 - Recording `GameMessageSink` asserting exact ordered message tuples for game-bind
   press/release — this is what pins the `WM_SYSKEYDOWN` divergence (#27).
-- Load the DLL and assert zero files, zero windows, unchanged thread count *before* the
-  first export call.
+- Load the DLL and assert no window and no created directory *before* the first export
+  call — **done** (§4.A6). Note the survey's "unchanged thread count" is **not** sound and
+  was dropped after measurement: `LoadLibrary` makes Windows start its own loader worker
+  threads, so a proxy that runs no code at all still moved the count by +2. Attributing a
+  thread to the module needs each thread's Win32 start address tested against the module's
+  address range; a raw count fails on innocent input, which is worse than no check.
 - Extend `smoke-proxy` beyond its single `D3DPERF_GetStatus` so the D3D11 and DXGI
   resolution paths are covered at all.
 

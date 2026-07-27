@@ -106,7 +106,7 @@ diagnosably — and none of it needs a game.
 | ~~`A4` MSVC offset oracle~~ | B | M | **Done for revision 6.** `xtask verify-abi` has MSVC confirm 60 facts against the vendored MIT header, in CI. v1–v5 are not in the public header, so they stay author-computed — see the `CONFORMANCE.md` §4.A4 scope note |
 | `A4` interior offsets for v2/v3/v4; `GetAddonDef` and ImGui-version asserts | B | S | Size-only today |
 | `A5` export directory assertions | B | S | Partly exists |
-| `A6` TLS callbacks + no-`Drop`-`thread_local` rule | B | S | The image has a TLS directory today, so this is live |
+| ~~`A6` TLS callbacks + load purity~~ | B | S | **Done.** `smoke-proxy` asserts one TLS callback and no window/directory at load. The `thread_local`-`Drop` hazard is not machine-checkable and stays a review rule — see `CONFORMANCE.md` §4.A6 |
 | `A3` resource inventory decisions | B/G | S | Assert the decision per id; empty is currently indistinguishable from unstarted |
 | `B` value tables in full, including length | B | M | 177 bind ids, 100 scan codes both ways, 111 defaults, log levels, 63 HTTP phrases, enums, MD5 vectors |
 | `B` golden round-trips for five file formats | B | M | Catches the three known byte deltas: XML `encoding`, 52-vs-53-space indent, LF vs CRLF |
@@ -116,7 +116,7 @@ diagnosably — and none of it needs a game.
 | `C` stub swap-chain vtable harness | B | M | Sentinel `HRESULT`s verbatim, native runs once, panic-safe |
 | `C` stub chainload harness | B | M | `#33`: PATH discovery, self-module guard, per-export recursion |
 | `C` recording `GameMessageSink` | B | S | Pins `#27`'s `WM_SYSKEYDOWN` divergence |
-| `C` pre-export purity + `smoke-proxy` widening | B | S | Zero files/windows/threads before the first export call |
+| `C` `smoke-proxy` widening beyond `D3DPERF_GetStatus` | B | S | Pre-export purity done (`A6`); still only one export is forwarded, so the D3D11 and DXGI resolution paths are uncovered |
 
 Several of these can only be *finalized* once `H` answers land (CRLF, mouse-button values,
 ordinals). Build the harness with the question marked, not blocked — then close it when the
