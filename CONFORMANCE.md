@@ -328,17 +328,26 @@ native code from disk, so it must happen on the render thread with the API table
 installed, and it must respect the volatile/350-build rule (#8) and the config's
 enabled/disabled state (#19) before loading anything.
 
-**One constraint on the cleaner that is easy to hit and awkward to discover late.**
-`AddonManager` is `Send + Sync`, so its `RegistrationCleaner` must be too — but the typed
-adapters in `nexus-addon-cleanup/src/direct.rs` take `Rc<RefCell<FontManager<B>>>`, which is
-neither. The font manager is render-thread-local, so no `Send` cleaner can hold it directly.
+**A correction, because an earlier revision of this section stated the opposite and was
+wrong.** `nexus_host::RegistrationCleaner` has **no `Send` bound**
+(`nexus-host/src/host.rs:90`), `TypedAdapter::new` takes `FnMut + 'static` with no `Send`
+bound either, and nothing anywhere requires `AddonManager` to be `Send` or `Sync`. Only
+`LoaderPlatform` carries those bounds. The claim that a `Send` cleaner was required — and
+that the font slots therefore *had* to route through `RuntimeFontBridge` — was false.
 
-The resolution already exists: build the font cleanup slots over **`RuntimeFontBridge`**
-rather than the raw manager. That is exactly why `cleanup_owner_callbacks` and
-`cleanup_owner_resources` are on `RenderFontService` — the bridge is `Send + Sync` and
-internally routes to the thread-local manager, inline or queued. The same reasoning applies
-to any other cleanup slot whose service is render-thread-local: route it through the
-add-on-facing service, not the underlying one.
+**The manager is free to be render-thread-local, and should be**, since activation runs
+untrusted native code that must execute on the render thread anyway. That makes the
+`Rc<RefCell<…>>` adapters in `direct.rs` usable as written.
+
+One real constraint survives, for a different reason than the one given before: the runtime's
+font manager is not held as an `Rc<RefCell<FontManager<B>>>` that can be handed to
+`direct::font_callbacks`. It lives inside `FontSession` in the thread-local `FONT_SESSIONS`
+map, keyed by coordinator id. So the font slots still need an adapter that reaches it —
+`RuntimeFontBridge` is the natural one, since it already encapsulates that lookup and its
+re-entrancy rule — but this is now a **handle-shape** problem, not a thread-safety one, and
+it is a choice rather than a requirement. The same applies to textures:
+`direct::textures` wants a raw `Arc<TextureService>`, whereas the runtime owns a
+session-scoped coordinator.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
