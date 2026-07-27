@@ -40,26 +40,42 @@ Internals are free. Idiomatic Rust, better data structures, different threading,
 locking — all encouraged. Do not mirror the reference's class hierarchy, control flow, or
 naming to feel safe. Mirror its *observable edge*.
 
-### 2.2 An observable bug is part of the contract
+### 2.2 Fix every defect; the interface is frozen
 
-This is the rule that costs people their weekend. If a defect is detectable from outside,
-addons have adapted to it, and "fixing" it is a breaking change.
+**No bugs. This is a better host, not a transcription.** Every defect in the reference gets
+fixed — memory-safety faults, dead code paths, features that throw, races, the lot.
 
-Fix freely where undetectable. Where a defect is observable, **preserve it bug-for-bug and
-record it here as an intentional requirement** — never silently correct it. Precedents
-already in this codebase: the legacy `WM_USER` passthrough offset `7997`; "matching the
-observable legacy order" in settings notification; the sub-1024×768 minimum-resolution
-scaling rule; and `PROVENANCE.md` deliberately retaining `EGameBinds` numeric value `10`.
+What is frozen is the **interface**, not the behaviour behind it: names, byte offsets,
+numeric values, file formats, and ordering that a third party *transmits, stores, or
+compares*. A constant is not a bug. `EGameBinds` value `10`, the `WM_USER` passthrough
+offset `7997`, and the sub-1024×768 scaling rule are contract, and keeping them is not
+"preserving a bug" — it is implementing the protocol.
 
-Three live examples of the trap, all currently "improvements" that break compatibility:
+The narrow case that needs care: a defect expressed **through** the interface, where the
+wrong value *is* the wire format. There the fix is still the goal, but it needs a
+measurement first, because "correct" and "what the other party parses" can differ.
 
-- Promoting an Alt-modified game bind to `WM_SYSKEYDOWN` (register #27). The reference
-  sends the *ordinary* message with lParam bit 29. Every other addon's WndProc sees this.
-- Rejecting log levels `0` and `6` from addons (#31). The reference emits the line with
-  severity `(null)`. Rejecting it silently drops an addon's log output.
-- Implementing definition flag `1<<3` ("can create own ImGui context") by passing null
-  context/allocators (#39). The reference ignores the flag and always passes non-null.
-  Honouring it would null-deref every addon that sets it.
+Worked through, this is a much smaller set than it first appears. Of the three cases
+originally filed here as "preserve the bug", two dissolve on inspection:
+
+| Case | Verdict |
+|---|---|
+| Log levels `0` and `6` rejected (#31) | **Fix.** The reference is lenient and emits the line with severity `(null)`; Rust is strict and *loses an addon's log output*. Rust's strictness is the defect. Matching the reference is both the fix and the compatible choice — no tension at all |
+| Definition flag `1<<3`, "can create own ImGui context" (#39) | **Already correct.** The reference ignores the flag and always passes a non-null context and allocators. "Implementing" it by passing nulls would null-deref every addon that sets it. Ignoring it is the safe reading, not a bug — assert it so nobody "fixes" it |
+| Alt-modified game bind promoted to `WM_SYSKEYDOWN` (#27) | **Genuinely open.** The reference sends the *ordinary* message with lParam bit 29. This is read by the game itself and by every other addon's WndProc. Settle it with the operator test in §7: if GW2 accepts both equivalently the improvement stays; if not, the ordinary message is required. One measurement, then it is closed either way |
+
+Where Rust is **already better and staying that way**: `ResizeBuffers1` hooked at the slot
+that actually fires rather than the reference's dead slot-26 hook (#36); Mumble identity
+truncated at a char boundary instead of overflowing a 20-byte array (#11); `IsGameplay`
+driven by a real counter where the reference latches it at `1` forever (#37); atomic
+temp-file writes so a crash mid-save cannot truncate a user's config. §9 lists the rest.
+
+Two reference features are outright broken — uninstall is a commented-out no-op, and "check
+for updates" throws. **Implement both properly.** There is no compatibility argument for
+reproducing a throw.
+
+The single rule: **fix it, and if the fix changes a byte a third party reads, prove the
+change is transparent before shipping it.** Record the proof in the register row.
 
 ### 2.3 Do not reproduce the reference's in-progress refactor
 
@@ -90,11 +106,71 @@ Some differences are mandatory. Reverting them in the name of compatibility caus
 |---|---|
 | `crates/nexus-network/src/update.rs:18-22` points self-update at **this project's** releases | Repointing it at the legacy endpoint makes the Rust host overwrite itself with the C++ DLL and silently undo the swap |
 | All icons, banners, style presets, typefaces and 11 locale tables independently authored | The reference's are proprietary; `res/Locales` is an unpopulated submodule there anyway |
-| Identity strings in `VERSIONINFO` (CompanyName, LegalCopyright, ProductName) are ours | Reproduce the field *names* and layout, never the reference's values |
+| No third-party brand identity anywhere in the artifact | Decided: we recreate the functionality, not the brand. See §2.5 |
 | Mumble identity name truncated at a char boundary rather than overflowing a 20-byte array | Do not reproduce a memory-safety defect; truncation is correct for both trees (#11) |
 
 Low-risk deliberate divergences worth recording rather than reverting: the network cache
 key, `User-Agent: Nexus/1.0`, and the finite 15/15/30/30s WinHTTP timeouts.
+
+### 2.5 Brand identity is removed; protocol identifiers are not
+
+**Decision: no third-party brand identity ships in this artifact.** We reimplement the
+functionality, not the badging.
+
+**The product is `Tessera`.** A tessera is one tile in a mosaic — many independent pieces
+composing a single coherent surface, which is what an addon host is. It appropriates neither
+vendor's identity, which rules out GW2-native terms (Waypoint, Sigil, Mistward) for the same
+reason it rules out Raidcore's: `README.md:62` disclaims affiliation with ArenaNet and NCSoft
+too, and that disclaimer has to stay true.
+
+The `nexus-*` crate names **stay**. They name the protocol the crates implement, the way a
+crate called `http-parser` does — they are invisible in the shipped artifact, and renaming 36
+crates plus every `use` path is churn with no user-visible benefit. If that ever changes it
+is a mechanical rename, not a design decision.
+
+This needs one line drawn carefully, because some strings that *look* like branding are
+wire format. The word "Nexus" is welded into the addon ABI and the on-disk layout: an addon
+calls `DataLink.Get("DL_NEXUS_LINK")` with that literal, and `<GW2>/addons/Nexus/` holds
+every user's `Settings.json`, `InputBinds.json`, `GameBinds.xml` and `AddonConfig.json`.
+Renaming those does not de-brand anything — it breaks every addon and abandons every user's
+preferences, which is the exact failure §1 exists to prevent.
+
+So: **an identifier a third party transmits, stores, or opens by name is protocol and stays
+verbatim. Everything that identifies the vendor is removed.**
+
+| Remove — vendor identity | Replace with |
+|---|---|
+| `VERSIONINFO` `CompanyName "Raidcore"`, `LegalCopyright "© 2021-2026 Raidcore"`, `ProductName "Nexus"`, `FileDescription` (`res/Nexus.rc:74-79`) | `ProductName "Tessera"`, our own `CompanyName`/`LegalCopyright`, and a `FileDescription` that does not use a trademarked game name. Reproduce the field *names* and layout only |
+| `https://raidcore.gg/Legal` — the licence modal's link | Our own terms, or reconsider the gate. The `AcceptEULA` **settings key name stays** (#15) or every user re-prompts on upgrade |
+| `https://discord.gg/raidcore` — the About page link | Our own, or nothing |
+| `https://api.raidcore.gg/addonlibrary`, `/arcdpslibrary` — the in-game library sources | Our own catalogue source. Also removes an operational dependency on a third party's servers. **See the open question below** |
+| `https://api.raidcore.gg` — the updater endpoint | Already ours (§2.4) |
+| All logos, banners, icons, style presets, typefaces, the copyright footer | Independently authored (§5 of `ROADMAP.md`) |
+| The overlay window title and any in-UI product name | Our name. Not ABI — addons register their *own* ImGui window names |
+| `AddonInterfaces::RAIDCORE` (`nexus-abi/src/addon.rs:143`) | Free to rename: this is a **host-internal** module-detection bitset, absent from every API revision and from `AddonDefinitionFlags` |
+
+| Keep verbatim — protocol, not brand | Why |
+|---|---|
+| `DL_NEXUS_LINK`, `DL_NEXUS_LINK_<pid>`, `DL_MUMBLE_LINK`, `DL_MUMBLE_LINK_IDENTITY` | Addons pass these literals to `DataLink.Get`/`.Share`. Hard ABI |
+| `<GW2>/addons/Nexus/` and every file in it | Holds all existing user state. Renaming abandons it |
+| `Nexus.log`, `Nexus_<value>.log` | User-visible artifact and the first thing in every bug report |
+| `AN-Mutex-Window-Guild Wars 2` | **ArenaNet's** object name, matched by substring. Required for multibox (#23) |
+| `MumbleLink` | The game's own shared-memory object |
+| `assetcdn.101.arenanetworks.com/latest64/101` | The game's own build endpoint, required by the volatile rule (#8) |
+| `arcdps_integration64.dll`, `.imstyle180`, `THIRDPARTYSOFTWAREREADME.TXT` | Reserved/observable names carrying no vendor identity |
+| All `EV_*`, `KB_*` and API-table identifiers | No vendor identity, and all are ABI |
+
+**One judgment call: `RCGG-Mutex-Patch-Nexus`** (`Updater.cpp:19-24`) is a vendor-branded
+*named system object* — the cross-process lock preventing two clients patching at once.
+Rename it. The only way that regresses is a user multiboxing two separate installs, one C++
+and one Rust, both self-updating simultaneously; that is vanishingly narrow and
+self-inflicted, and it does not justify shipping someone else's brand in a kernel object
+name. Recorded as a decision, not an oversight.
+
+**Open question, functional rather than brand:** the in-game addon library is a real feature
+(browse and install without leaving the game). Removing the vendor's catalogue URLs does not
+remove the feature — it needs a source. Either we host a catalogue, or the page ships
+present-but-empty. Decide before Phase 6; do not silently drop the feature.
 
 ---
 
@@ -352,11 +428,13 @@ Whether the C++ extension check is case-sensitive (does `Foo.DLL` load?). Whethe
 `RtlCaptureStackBackTrace` reaches an addon frame from a MinHook trampoline. Screenshots at
 fixed resolution/UI-size/DPI for layout comparison.
 
-**Operator decisions, not findings:** Whether to keep Raidcore branding, banners, outbound
-links and the copyright footer. Whether to ship bug-for-bug parity for the two visibly
-broken C++ paths (uninstall is a commented-out no-op; "check for updates" throws). The asset
-programme — independently authored icons, banners, style presets, fonts and all 11 locale
-tables, none of which may be copied.
+**Settled, no longer open:** branding is removed and the product is `Tessera` (§2.5). The two
+broken reference paths (no-op uninstall, throwing update check) are **implemented properly**,
+not reproduced (§2.2). The asset programme is independently authored throughout — icons,
+banners, style presets, typefaces and all 11 locale tables, none copied (`ROADMAP.md` §5).
+
+**Still open, and functional rather than cosmetic:** where the in-game addon library's
+catalogue comes from once the vendor's URLs are gone (§2.5). Decide before Phase 6.
 
 ---
 

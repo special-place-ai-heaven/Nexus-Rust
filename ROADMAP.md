@@ -283,9 +283,13 @@ None of this is answerable from source. Each unanswered item leaves a register r
 
 Items 1 and 8 are the highest leverage: each can delete a large piece of work.
 
-**Decisions only you can make:** whether to keep Raidcore branding, banners, outbound links
-and the copyright footer; whether to ship bug-for-bug parity for the two visibly broken C++
-paths (uninstall is a commented-out no-op, "check for updates" throws).
+**Decided, no longer blocking:** branding is removed entirely and the product is `Tessera`
+(`CONFORMANCE.md` §2.5). The two broken reference paths — the no-op uninstall and the
+throwing update check — are implemented properly rather than reproduced (§2.2).
+
+**Still open:** where the in-game addon library's catalogue comes from, now that the
+vendor's URLs are gone. This is a hosting question, not a branding one, and the feature
+should not be silently dropped for want of an answer. Needed before Phase 6.
 
 ---
 
@@ -301,6 +305,7 @@ None can be copied. `res/Locales` is an unpopulated submodule in the C++ tree an
 | Three typefaces with Latin-Extended + Cyrillic + CJK coverage | `#45` | Without coverage, a Russian or Chinese addon's UI renders as blank boxes |
 | Quick Access icons (incl. seasonal), page icons, tier icons, banners | `#15`, `#44` | |
 | Two built-in style presets | `#18`, `#38` | The reference's are base64 proprietary style data |
+| `Tessera` wordmark, application icon, About-page content | `#15`, `A2` | Replaces the removed vendor identity (`CONFORMANCE.md` §2.5). Small, but it gates the About page and the stamped `VERSIONINFO` |
 
 **Start with the English string table.** It is on the critical path for the entire UI phase,
 it is the largest single authoring job, and translation cannot begin until it exists.
