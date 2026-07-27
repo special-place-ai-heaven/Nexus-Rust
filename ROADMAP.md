@@ -133,6 +133,13 @@ answer arrives.
 behaviour is reproduced. This is the tier-2 core and it is mostly one subsystem, so it
 wants one owner rather than a fan-out.
 
+**The install order is now pinned** (`CONFORMANCE.md` §2.9): composition exists, and every
+service `compose` needs is already owned by the runtime **except two** — an
+`InlineHookService` instance (trivial) and an `Arc<dyn RenderFontService>` (the bounded
+synchronous font bridge, `HANDOFF.md:351-535`). The font bridge therefore gates the install,
+and it must land complete: a bridge that rejects `get` hands addons a null `ImFont*` that the
+host pushes unchecked, turning "addons do not load" into "addons load and crash".
+
 Settle **first**, before writing lifecycle code:
 
 1. ~~`#20` texture registry lifetime~~ — **settled** in `CONFORMANCE.md` §2.6: records and the identifier map are process-lifetime, the SRV is per-device. Implementation outstanding.
