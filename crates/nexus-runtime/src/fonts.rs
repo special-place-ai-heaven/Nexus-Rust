@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use nexus_addon_backend::{
     BackendOperationError, RenderFontService, RequiredServiceResult, SendFontCallback,
 };
+use nexus_addon_ffi::{AddonApiBackend, InstalledAddonApi, install_render_session};
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
 use nexus_dxgi::RenderCallbackError;
 use nexus_imgui_compat::sys;
@@ -857,6 +858,9 @@ impl Drop for FontSessionLease {
 struct RuntimeRenderObserver {
     fonts: Arc<RuntimeFontCoordinator>,
     textures: Arc<dyn RenderSessionObserver>,
+    /// Produces the add-on API backend for one render session, or `None` when the runtime
+    /// composed no backend. Built per attach so the backend never outlives its session.
+    addon_api: Option<Arc<dyn Fn() -> Arc<dyn AddonApiBackend> + Send + Sync>>,
 }
 
 impl RenderSessionObserver for RuntimeRenderObserver {
@@ -875,9 +879,43 @@ impl RenderSessionObserver for RuntimeRenderObserver {
             )
             .map_err(map_attach_error)?;
         let texture = self.textures.attach(resources)?;
+
+        // Install the native API table last, so a failure in fonts or textures cannot
+        // leave add-ons holding pointers into a session that never finished attaching.
+        // The lease lives in the combined attachment and therefore retires with the
+        // session, which is what keeps a table from outliving the context it names.
+        let addon_api = match &self.addon_api {
+            Some(backend) => {
+                // SAFETY: `resources` describes the live selected swap chain and its Dear
+                // ImGui context, both of which outlive this attachment because the
+                // returned lease is dropped when the render session is retired. Native
+                // arguments reaching the backend satisfy its documented contract, which
+                // every adapter enforces at its own boundary.
+                match unsafe {
+                    install_render_session(
+                        resources.generation(),
+                        resources.swap_chain(),
+                        resources.imgui_context(),
+                        backend(),
+                    )
+                } {
+                    Ok(installed) => Some(installed),
+                    Err(error) => {
+                        // A session without the add-on API is degraded but usable: the
+                        // overlay still renders. Refusing the whole attachment would lose
+                        // the overlay too, which is strictly worse.
+                        crate::diagnostics::report_proxy_failure(&error);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Ok(Box::new(CombinedRenderSessionLease {
             font: Some(Box::new(font)),
             texture: Some(texture),
+            addon_api,
         }))
     }
 }
@@ -885,10 +923,14 @@ impl RenderSessionObserver for RuntimeRenderObserver {
 struct CombinedRenderSessionLease {
     font: Option<Box<dyn RenderSessionAttachment>>,
     texture: Option<Box<dyn RenderSessionAttachment>>,
+    addon_api: Option<InstalledAddonApi>,
 }
 
 impl Drop for CombinedRenderSessionLease {
     fn drop(&mut self) {
+        // The API table retires first. Add-ons must stop being able to reach the font and
+        // texture services before those services are torn down, not after.
+        drop(self.addon_api.take());
         drop(self.font.take());
         drop(self.texture.take());
     }
@@ -898,8 +940,13 @@ impl Drop for CombinedRenderSessionLease {
 pub(crate) fn production_observer(
     fonts: Arc<RuntimeFontCoordinator>,
     textures: Arc<dyn RenderSessionObserver>,
+    addon_api: Option<Arc<dyn Fn() -> Arc<dyn AddonApiBackend> + Send + Sync>>,
 ) -> Arc<dyn RenderSessionObserver> {
-    Arc::new(RuntimeRenderObserver { fonts, textures })
+    Arc::new(RuntimeRenderObserver {
+        fonts,
+        textures,
+        addon_api,
+    })
 }
 
 fn replace_thread_session(
@@ -1618,6 +1665,7 @@ mod tests {
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let lease = CombinedRenderSessionLease {
+            addon_api: None,
             font: Some(Box::new(Probe {
                 label: "font",
                 events: Arc::clone(&events),

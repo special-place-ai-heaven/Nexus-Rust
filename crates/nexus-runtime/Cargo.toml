@@ -17,6 +17,7 @@ embed-resource.workspace = true
 [dependencies]
 nexus-abi.workspace = true
 nexus-addon-backend.workspace = true
+nexus-addon-ffi.workspace = true
 nexus-control.workspace = true
 nexus-data-services.workspace = true
 nexus-dxgi.workspace = true

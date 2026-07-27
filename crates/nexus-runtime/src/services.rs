@@ -188,8 +188,16 @@ impl RuntimeServices {
             Arc::clone(&textures),
             paths.get(PathKey::TexturesDirectory).to_path_buf(),
         );
+        // The add-on API is not installed yet, and passing `None` here is deliberate
+        // rather than unfinished plumbing. `compose_addon_api` needs a
+        // `NativeCallBoundary`, which needs an `AddressOwnerResolver` — the addon
+        // manager's address-ownership index. Until this runtime links the addon manager
+        // and loads modules through it, no address resolves to an owner, so every API call
+        // would fail caller attribution: a backend that is installed but rejects
+        // everything, which is worse than none because add-ons would load and then find a
+        // dead table. See `CONFORMANCE.md` §2.9.
         let render_observer =
-            crate::fonts::production_observer(Arc::clone(&fonts), texture_observer);
+            crate::fonts::production_observer(Arc::clone(&fonts), texture_observer, None);
         let (game_input, game_input_error) =
             crate::game_input::RuntimeGameInput::load(paths.get(PathKey::GameBinds).to_path_buf());
         if let Some(error) = game_input_error {

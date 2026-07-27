@@ -278,13 +278,30 @@ WndProc registry and managed binds from `input`, the game invoker and message si
 coordinator. Two ownership changes were needed for shared access: the log registry and
 scheduler are now `Arc`.
 
-**What remains is one call.** `install_render_session(generation, swap_chain, imgui_context,
-backend)` must be invoked from the render-session attachment path, which is the only place
-holding a live swap chain and ImGui context, and the returned `InstalledAddonApi` lease must
-be held for that session's lifetime. Loading add-ons additionally needs the `-loader`,
-`-manager`, `-watch` and `-cleanup` crates and a directory scan. Everything up to that call
-now compiles and is covered; the composition path carries a `dead_code` allowance until the
-call exists.
+**The install path is wired, and switched off deliberately.**
+`RuntimeRenderObserver::attach` now calls `install_render_session` when it is given a
+backend, and the returned `InstalledAddonApi` lives in `CombinedRenderSessionLease` so it
+retires with the session. Two ordering rules are encoded there:
+
+- The table installs **last**, after fonts and textures attach, so a failure in either
+  cannot leave add-ons holding pointers into a session that never finished attaching.
+- The lease drops **first**, before the font and texture leases, so add-ons stop being able
+  to reach those services before they are torn down rather than after.
+
+An install failure degrades to a session without the add-on API rather than refusing the
+attachment, because the overlay still renders and losing it too would be strictly worse.
+
+**The remaining blocker is caller attribution, not plumbing.** `production_observer` is
+passed `None` today. `compose_addon_api` needs a `NativeCallBoundary`, which needs an
+`AddressOwnerResolver` — the addon manager's address-ownership index. Until the runtime links
+`nexus-addon-manager` and loads modules through it, no address resolves to an owner, so every
+API call would fail attribution. That would install a backend which rejects everything: worse
+than none, because add-ons would load and find a dead table. Register #5 covers the related
+rule that read-only queries should be served without attribution at all.
+
+So the honest order for the next step is: link the loader and manager, load one module, and
+pass the resulting ownership index in — at which point the `None` becomes a composed backend
+and the install turns on.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
