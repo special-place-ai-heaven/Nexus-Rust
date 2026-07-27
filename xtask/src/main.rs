@@ -32,6 +32,47 @@ const EXPECTED_EXPORTS: [(&str, u32); 20] = [
     ("DXGIDeclareAdapterRemovalSupport", 20),
 ];
 
+/// Lowercase module-name prefixes identifying a dynamically linked C/C++ runtime.
+///
+/// `VCRUNTIME140.dll` and `MSVCP140.dll` ship only with the Visual C++
+/// redistributable, so importing them makes the proxy unloadable on a machine that
+/// has never installed it — and because Guild Wars 2 imports `d3d11.dll` statically,
+/// an unloadable proxy means the game does not start at all. The `api-ms-win-crt-*`
+/// forwarders and `ucrtbase.dll` are part of Windows 10 and resolve there, but a
+/// static-CRT build emits none of these: any hit proves the `crt-static` rustflags in
+/// `.cargo/config.toml` did not reach this build.
+const DYNAMIC_RUNTIME_PREFIXES: [&str; 5] =
+    ["api-ms-win-crt-", "msvcp", "msvcr", "ucrtbase", "vcruntime"];
+
+/// Lowercase module names the release proxy is permitted to import.
+///
+/// Every entry is either OS-guaranteed or a module the C++ reference links too
+/// (`d3dcompiler_47` and `xinput1_4` arrive through Dear ImGui's own pragmas). Adding
+/// a name is a decision about the dependency surface and the supported Windows floor
+/// — `bcryptprimitives.dll` puts the floor at Windows 10 — so an unlisted import
+/// fails the gate instead of being accepted silently.
+const ALLOWED_IMPORTS: [&str; 10] = [
+    "bcryptprimitives.dll",
+    "d3dcompiler_47.dll",
+    "kernel32.dll",
+    "normaliz.dll",
+    "ntdll.dll",
+    "oleaut32.dll",
+    "shell32.dll",
+    "user32.dll",
+    "winhttp.dll",
+    "xinput1_4.dll",
+];
+
+/// Lowercase prefix for Windows API sets, which are OS components rather than
+/// redistributables.
+///
+/// Allowed by prefix because the exact api-set names a build binds vary between
+/// toolchain versions; pinning them individually would make this gate fail on
+/// unrelated upgrades. `api-ms-win-crt-*` is excluded by
+/// [`DYNAMIC_RUNTIME_PREFIXES`], which is checked first.
+const ALLOWED_IMPORT_PREFIX: &str = "api-ms-win-core-";
+
 fn main() -> ExitCode {
     match run() {
         Ok(message) => {
@@ -48,7 +89,10 @@ fn main() -> ExitCode {
 fn run() -> Result<String, String> {
     let mut arguments = env::args_os().skip(1);
     let Some(command) = arguments.next() else {
-        return Err("expected `verify-exports [path]` or `smoke-proxy [path]`".into());
+        return Err(
+            "expected `verify-exports [path]`, `verify-imports [path]`, or `smoke-proxy [path]`"
+                .into(),
+        );
     };
 
     let path = arguments
@@ -66,6 +110,13 @@ fn run() -> Result<String, String> {
         Ok(format!(
             "verified {} named exports and ordinals in {}",
             EXPECTED_EXPORTS.len(),
+            path.display()
+        ))
+    } else if command == OsStr::new("verify-imports") {
+        let modules = verify_imports(&path)?;
+        Ok(format!(
+            "verified {} imported modules in {}; the C runtime is linked statically",
+            modules.len(),
             path.display()
         ))
     } else if command == OsStr::new("smoke-proxy") {
@@ -138,7 +189,87 @@ fn verify_exports(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_pe_exports(image: &[u8]) -> Result<BTreeMap<u32, String>, String> {
+fn verify_imports(path: &Path) -> Result<Vec<String>, String> {
+    let image =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let modules = read_pe_imports(&image)?;
+
+    let mut dynamic_runtime = Vec::new();
+    let mut unexpected = Vec::new();
+    for module in &modules {
+        let lowered = module.to_ascii_lowercase();
+        if DYNAMIC_RUNTIME_PREFIXES
+            .iter()
+            .any(|prefix| lowered.starts_with(prefix))
+        {
+            dynamic_runtime.push(module.clone());
+        } else if !lowered.starts_with(ALLOWED_IMPORT_PREFIX)
+            && !ALLOWED_IMPORTS.contains(&lowered.as_str())
+        {
+            unexpected.push(module.clone());
+        }
+    }
+
+    if !dynamic_runtime.is_empty() {
+        return Err(format!(
+            "the proxy links the C runtime dynamically: {dynamic_runtime:?}\n\
+             a static-CRT build imports none of these, so the `crt-static` rustflags in \
+             .cargo/config.toml did not reach this build\n\
+             all imports: {modules:?}"
+        ));
+    }
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "unexpected imports: {unexpected:?}\n\
+             add each to ALLOWED_IMPORTS only as a deliberate decision about the dependency \
+             surface and the supported Windows floor\n\
+             all imports: {modules:?}"
+        ));
+    }
+    Ok(modules)
+}
+
+fn read_pe_imports(image: &[u8]) -> Result<Vec<String>, String> {
+    let headers = read_pe_headers(image)?;
+    if read_u32(image, checked_add(headers.optional, 108)?)? < 2 {
+        return Err("PE image has no import data directory".into());
+    }
+
+    let import_rva = read_u32(image, checked_add(headers.optional, 120)?)?;
+    if import_rva == 0 {
+        return Err("PE image has an empty import data directory".into());
+    }
+
+    let mut descriptor = rva_to_offset(import_rva, headers.size_of_headers, &headers.sections)?;
+    let mut modules = Vec::new();
+    loop {
+        // A descriptor whose name RVA is zero terminates the table.
+        let name_rva = read_u32(image, checked_add(descriptor, 12)?)?;
+        if name_rva == 0 {
+            break;
+        }
+        let name_offset = rva_to_offset(name_rva, headers.size_of_headers, &headers.sections)?;
+        modules.push(read_ascii_z(image, name_offset)?);
+        if modules.len() > 512 {
+            return Err("PE import descriptor table is unreasonably long".into());
+        }
+        descriptor = checked_add(descriptor, 20)?;
+    }
+
+    // A PE may name the same module in more than one descriptor, and casing is not
+    // normalised by the linker.
+    modules.sort_by_key(|module| module.to_ascii_lowercase());
+    modules.dedup_by_key(|module| module.to_ascii_lowercase());
+    Ok(modules)
+}
+
+struct PeHeaders {
+    optional: usize,
+    size_of_headers: u32,
+    sections: Vec<Section>,
+}
+
+fn read_pe_headers(image: &[u8]) -> Result<PeHeaders, String> {
     if image.get(0..2) != Some(b"MZ") {
         return Err("artifact has no DOS MZ header".into());
     }
@@ -157,19 +288,33 @@ fn read_pe_exports(image: &[u8]) -> Result<BTreeMap<u32, String>, String> {
     if read_u16(image, optional)? != 0x20b {
         return Err("artifact is not PE32+".into());
     }
+
+    let size_of_headers = read_u32(image, checked_add(optional, 60)?)?;
+    let section_table = checked_add(optional, optional_size)?;
+    let sections = read_sections(image, section_table, section_count)?;
+    Ok(PeHeaders {
+        optional,
+        size_of_headers,
+        sections,
+    })
+}
+
+fn read_pe_exports(image: &[u8]) -> Result<BTreeMap<u32, String>, String> {
+    let PeHeaders {
+        optional,
+        size_of_headers,
+        sections,
+    } = read_pe_headers(image)?;
     if read_u32(image, checked_add(optional, 108)?)? < 1 {
         return Err("PE image has no export data directory".into());
     }
 
-    let size_of_headers = read_u32(image, checked_add(optional, 60)?)?;
     let export_rva = read_u32(image, checked_add(optional, 112)?)?;
     let export_size = read_u32(image, checked_add(optional, 116)?)?;
     if export_rva == 0 || export_size == 0 {
         return Err("PE image has an empty export data directory".into());
     }
 
-    let section_table = checked_add(optional, optional_size)?;
-    let sections = read_sections(image, section_table, section_count)?;
     let export_offset = rva_to_offset(export_rva, size_of_headers, &sections)?;
     let ordinal_base = read_u32(image, checked_add(export_offset, 16)?)?;
     let function_count = read_u32(image, checked_add(export_offset, 20)?)?;
@@ -323,10 +468,66 @@ fn checked_mul(left: usize, right: usize) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_pe_exports;
+    use super::{
+        ALLOWED_IMPORT_PREFIX, ALLOWED_IMPORTS, DYNAMIC_RUNTIME_PREFIXES, read_pe_exports,
+        read_pe_imports,
+    };
+
+    /// Mirrors the classification in `verify_imports` so the policy can be checked
+    /// without a PE image.
+    fn is_dynamic_runtime(module: &str) -> bool {
+        let lowered = module.to_ascii_lowercase();
+        DYNAMIC_RUNTIME_PREFIXES
+            .iter()
+            .any(|prefix| lowered.starts_with(prefix))
+    }
+
+    fn is_allowed(module: &str) -> bool {
+        let lowered = module.to_ascii_lowercase();
+        lowered.starts_with(ALLOWED_IMPORT_PREFIX) || ALLOWED_IMPORTS.contains(&lowered.as_str())
+    }
 
     #[test]
     fn rejects_non_pe_input() {
         assert!(read_pe_exports(b"not a PE image").is_err());
+        assert!(read_pe_imports(b"not a PE image").is_err());
+    }
+
+    #[test]
+    fn classifies_the_redistributable_runtime_as_dynamic_regardless_of_case() {
+        for module in [
+            "VCRUNTIME140.dll",
+            "vcruntime140d.dll",
+            "MSVCP140.dll",
+            "msvcr120.dll",
+            "ucrtbase.dll",
+            "api-ms-win-crt-heap-l1-1-0.dll",
+            "API-MS-WIN-CRT-STDIO-L1-1-0.DLL",
+        ] {
+            assert!(is_dynamic_runtime(module), "{module} must be rejected");
+        }
+    }
+
+    #[test]
+    fn separates_os_api_sets_from_the_crt_api_sets() {
+        // Both are `api-ms-win-*`; only the CRT family indicates dynamic linkage.
+        assert!(is_allowed("api-ms-win-core-synch-l1-2-0.dll"));
+        assert!(!is_dynamic_runtime("api-ms-win-core-synch-l1-2-0.dll"));
+        assert!(is_dynamic_runtime("api-ms-win-crt-runtime-l1-1-0.dll"));
+        assert!(!is_allowed("api-ms-win-crt-runtime-l1-1-0.dll"));
+    }
+
+    #[test]
+    fn admits_the_expected_modules_and_refuses_unlisted_ones() {
+        assert!(is_allowed("KERNEL32.dll"), "casing must not matter");
+        assert!(
+            is_allowed("d3dcompiler_47.dll"),
+            "the reference links it too"
+        );
+        assert!(
+            !is_allowed("wininet.dll"),
+            "an unlisted import is a decision"
+        );
+        assert!(!is_allowed("msvcp140.dll"));
     }
 }

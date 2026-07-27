@@ -39,6 +39,12 @@ jobs:
       - name: Verify proxy exports
         run: cargo run -p xtask --release -- verify-exports target/release/d3d11.dll
 
+      # The proxy must load without a Visual C++ redistributable. A build that fails to
+      # pick up the crt-static rustflags is dynamically linked with no other outward sign,
+      # so this gate is what makes the fix stick.
+      - name: Verify static C runtime and import surface
+        run: cargo run -p xtask --release -- verify-imports target/release/d3d11.dll
+
       - name: Smoke-test system forwarding
         run: cargo run -p xtask --release -- smoke-proxy target/release/d3d11.dll
 

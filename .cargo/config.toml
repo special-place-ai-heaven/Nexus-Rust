@@ -1,0 +1,13 @@
+# The proxy links the C runtime statically, matching the C++ reference
+# (Nexus.vcxproj sets Release RuntimeLibrary to MultiThreaded).
+#
+# Guild Wars 2 imports d3d11.dll statically, so if our proxy declares an import on
+# a module that is not present, the OS refuses to map it and the game does not
+# start at all. VCRUNTIME140.dll ships only with the Visual C++ redistributable,
+# which a player is under no obligation to have installed.
+#
+# `cargo run -p xtask -- verify-imports <dll>` enforces the result on the built
+# artifact, and CI runs it. That gate is not optional polish: a build that fails to
+# pick these flags up produces a dynamically linked DLL with no other outward sign.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

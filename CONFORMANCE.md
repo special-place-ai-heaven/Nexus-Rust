@@ -183,7 +183,7 @@ else; until they pass, every other item in this document is untestable.
 
 | # | Gate | Status |
 |---|---|---|
-| 1.1 | Static CRT: the DLL loads with no VC++ redistributable installed | **FAILS** (verified, §4.A1) |
+| 1.1 | Static CRT: the DLL loads with no VC++ redistributable installed | **PASSES** — gated in CI (§4.A1) |
 | 1.2 | Overlay attaches without depending on the window-class literal | **FAILS** (#2) |
 | 1.3 | `nexus-runtime` actually links the addon subsystem so one addon can load | **FAILS** (#1) |
 | 1.4 | Process-wide DXGI interception, or a real GW2 trace proving per-object suffices | **UNPROVEN** (#28) |
@@ -223,13 +223,33 @@ instead of failing diagnosably.
 already has the whole PE parser (`rva_to_offset`, `read_sections`, `read_u32`); the import
 directory is data-directory index 1, so this is a small addition, not new machinery.
 
-Verified against `target/release/d3d11.dll` by parsing the import directory (19 modules):
+**Status: closed.** `.cargo/config.toml` sets `-C target-feature=+crt-static` for the MSVC
+target, `xtask verify-imports` enforces the result, and CI runs it. The import surface went
+from **18 modules to 11**; the smoke test loads the static-CRT DLL and forwards a call.
 
-- **Reject:** `VCRUNTIME140.dll` and six `api-ms-win-crt-*` modules are **present today**.
-  A machine without the VC++ redistributable cannot map the DLL, so the game's static
-  import of `d3d11.dll` fails and *the game does not start at all*. Fix with
-  `-C target-feature=+crt-static` (reference: `Nexus.vcxproj:545` links the static CRT).
-  Reject `vcruntime*`, `msvcp*`, `ucrtbase*`, `api-ms-win-crt-*`.
+Proven with a flip test rather than asserted: the same gate binary exits `0` on the
+static-CRT artifact and `1` on the preserved dynamic-CRT artifact, naming all seven runtime
+modules. The counterfactual perturbed the build's linkage, never the measurement.
+
+The `--target` concern turned out not to apply on toolchain 1.97.1: the workspace's
+proc-macro crates (`syn`, `quote`, `serde_derive`, `thiserror-impl`, `windows-implement`,
+`windows-interface`, `zerocopy-derive`) all build with the flag in effect, so no explicit
+`--target` is needed and the CI artifact paths are unchanged. **Should a future toolchain
+change that, the fix is `--target x86_64-pc-windows-msvc` — and note the artifact then moves
+to `target/x86_64-pc-windows-msvc/release/`, which four workflow steps reference.**
+
+The original finding, against the pre-fix artifact (19 raw import entries, 18 unique):
+
+- **Reject:** `VCRUNTIME140.dll` plus six `api-ms-win-crt-*` modules were **present** before
+  the fix. Precisely: `VCRUNTIME140.dll` is the fatal one — it ships only with the Visual
+  C++ redistributable, so without it the OS refuses to map the DLL, the game's static import
+  of `d3d11.dll` fails, and *the game does not start at all*. The `api-ms-win-crt-*`
+  forwarders and `ucrtbase.dll` are Windows 10 components and do resolve there; they are not
+  independently fatal. They still fail the gate, because **a static-CRT build emits none of
+  them, so any hit proves the flag did not reach that build** — which is the stronger and
+  more useful signal. Fix: `-C target-feature=+crt-static` (reference: `Nexus.vcxproj:545`
+  links the static CRT). Reject `vcruntime*`, `msvcp*`, `msvcr*`, `ucrtbase*`,
+  `api-ms-win-crt-*`.
 - **Permit:** `d3dcompiler_47.dll` and `xinput1_4.dll` — the reference links these too, via
   ImGui's own pragmas. A naive denylist over-rejects here.
 - **Decide:** `bcryptprimitives.dll` puts the floor at Windows 10. The reference's

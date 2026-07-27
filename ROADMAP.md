@@ -70,25 +70,26 @@ Nine tracks. The letter is a stable handle for commits and checkpoints.
 
 | Item | WS | Size | Notes |
 |---|---|---|---|
-| `A1` static CRT + import allowlist gate | A | S | Two-line build change; the gate is a small extension of `xtask/src/main.rs:141`, which already parses the PE |
+| ~~`A1` static CRT + import allowlist gate~~ | A | S | **Done.** `.cargo/config.toml` plus `xtask verify-imports`, wired into CI. 18 imports → 11, flip-tested against the preserved dynamic artifact |
 | `A2` `VERSIONINFO` + workspace version | G | S | Version is `0.0.0`; nothing to stamp until it isn't |
 | Dispatch `H` operator homework | H | — | See section 4 — hand off immediately |
 | Kick off `I` asset programme | I | — | See section 5 — longest lead item in the project |
 
-**Trap found while scoping this.** The workspace contains proc-macro crates (`syn`,
-`quote`, `serde_derive`, `thiserror-impl`, `windows-implement`, `windows-interface`,
-`zerocopy-derive`). Setting `crt-static` in `.cargo/config.toml` under
-`[target.x86_64-pc-windows-msvc]` applies to host artifacts too when no `--target` is
-passed, which breaks proc-macro builds. Building **with** an explicit
-`--target x86_64-pc-windows-msvc` confines the flag to target artifacts.
+**Trap scoped, then measured.** The workspace contains proc-macro crates (`syn`, `quote`,
+`serde_derive`, `thiserror-impl`, `windows-implement`, `windows-interface`,
+`zerocopy-derive`), and `crt-static` in `.cargo/config.toml` applies to host artifacts too
+when no `--target` is passed. That predicts broken proc-macro builds. **On toolchain 1.97.1
+it does not happen** — all of them build with the flag in effect, so no `--target` is needed
+and the CI artifact paths are unchanged.
 
-The consequence is a footgun: **a build without `--target` silently produces a
-dynamically-linked DLL again.** So `A1`'s import gate is not optional polish — it is the
-only thing that makes the fix stick. Wire it into CI in the same commit, and have the
-release build fail rather than warn.
+The underlying footgun is still real and is why the gate exists: **a build that does not pick
+the flags up produces a dynamically-linked DLL with no other outward sign.** The gate is not
+optional polish; it is the only thing that makes the fix stick. If a future toolchain does
+break proc macros, the fix is `--target x86_64-pc-windows-msvc`, which moves the artifact to
+`target/x86_64-pc-windows-msvc/release/` and requires updating four workflow steps.
 
 **Exit:** `xtask verify-imports` passes on a release build; CI runs it; a stamped version
-appears in the image.
+appears in the image. — *`verify-imports` done; `A2` version stamping outstanding.*
 
 ---
 
