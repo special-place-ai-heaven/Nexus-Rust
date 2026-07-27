@@ -349,6 +349,39 @@ it is a choice rather than a requirement. The same applies to textures:
 `direct::textures` wants a raw `Arc<TextureService>`, whereas the runtime owns a
 session-scoped coordinator.
 
+### Where the manager lives — determined, not open
+
+`static SERVICES: OnceLock<Option<RuntimeServices>>` (`nexus-runtime/src/services.rs:67`)
+forces `RuntimeServices: Send + Sync`. An `AddonManager` whose cleaner holds `Rc` handles is
+neither, so **the manager cannot live in `RuntimeServices`.** It belongs in a render-thread
+`thread_local`, created on first use, exactly as `FONT_SESSIONS` already holds each
+`FontSession`.
+
+That is not a workaround. Activation executes untrusted native code and must run on the
+render thread; a render-thread-local manager makes that structural instead of a rule someone
+has to remember. It also matches the reference, whose loader runs inline on the render
+thread.
+
+What crosses the thread boundary is only the **`AddressOwnershipIndex`**, which is
+`Send + Sync` and already owned by `RuntimeServices`. The manager takes a clone via
+`ManagerRuntime::with_address_ownership_index`, so attribution and publication share one map
+while the manager itself stays thread-local. `RuntimeServices` therefore needs to expose that
+index; today it is a local in `build()` handed only to the render observer.
+
+With that settled the loader has no open design questions left — only the writing:
+
+1. Store the ownership index on `RuntimeServices` and expose it.
+2. Build the cleaner: `direct::inline_hooks`, `ui_host`, `raw_wndproc`, `managed_input`,
+   `events` wire straight from services the runtime already owns; fonts and textures need
+   small runtime-local adapters over the bridge and coordinator; `localization_overrides`
+   needs an `Rc<RefCell<LocalizationService>>` view. Unfilled slots stay fail-closed gaps
+   rather than silent successes, which `RegistrationCleaner::builder()` gives by default.
+3. Construct `AddonManager` in a render-thread `thread_local` with `StdDirectoryScanner`,
+   `WindowsPlatform`, `LoadedModuleAddressResolver`, that cleaner, the shared index, and the
+   installed session's `ApiTableCatalog`.
+4. Scan and activate — the only step that runs foreign code, gated on the volatile/350-build
+   rule (#8) and the config's enabled state (#19).
+
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
 half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and
