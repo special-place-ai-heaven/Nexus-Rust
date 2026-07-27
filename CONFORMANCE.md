@@ -208,6 +208,29 @@ The borrow discipline also has precedent to copy rather than invent:
 `try_borrow_mut` and maps a failed borrow to a closed `Busy` rejection, which is exactly the
 re-entrancy rule the specification demands.
 
+**One architectural fact determines the rest of the design, and it is easy to miss.** The
+`FontManager` does **not** live in the coordinator's `Mutex`. `FontCoordinatorState` holds
+only metadata — `attachment_id`, `identity`, `render_thread`
+(`nexus-runtime/src/fonts.rs:94-106`). The manager lives inside `FontSession` in a
+**thread-local** `FONT_SESSIONS`, which `advance` reaches through
+`FONT_SESSIONS.try_with(...)` plus `try_borrow_mut` (`fonts.rs:350-360`). The type's own doc
+comment says as much: "whose native font manager remains render-thread local".
+
+Two consequences follow, and they are not choices:
+
+1. **The bounded queue is structural, not an optimisation.** A call from a non-render thread
+   cannot touch the manager at all, because the manager is thread-local to the render thread.
+   Queue-and-wait is the only way an off-thread call can complete synchronously.
+2. **The inline path needs no new locking.** A call already on the render thread with the
+   matching context and attachment reaches the manager the same way `advance` does, and
+   `try_borrow_mut` failure is precisely the re-entrancy case the specification says must
+   reject closed rather than wait or panic.
+
+So the implementation shape is fixed: validate context and attachment on the current thread,
+then either execute inline through `FONT_SESSIONS` or enqueue an owned command with a
+one-shot response and block until the render thread drains it at the top of `advance`, before
+`session.advance`.
+
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
 half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and
