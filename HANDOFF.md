@@ -5,6 +5,11 @@ implementation. It records the repository state, verified architecture, exact
 remaining invariants, and the intended continuation order. All required design
 content is included below.
 
+**Read `CONFORMANCE.md` first.** It defines the acceptance standard and holds the
+gap register and release gate. Where the two documents disagree it wins, and
+`CONFORMANCE.md` section 10 lists the specific places this one is now known to be
+wrong — including the teardown order prescribed below, which is inverted.
+
 ## Stop: use the correct repository
 
 The canonical worktree is:
