@@ -112,6 +112,49 @@ Some differences are mandatory. Reverting them in the name of compatibility caus
 Low-risk deliberate divergences worth recording rather than reverting: the network cache
 key, `User-Agent: Nexus/1.0`, and the finite 15/15/30/30s WinHTTP timeouts.
 
+### 2.6 Settled: texture records are process-lifetime, GPU views are not
+
+`ROADMAP.md` requires this decided **before** the addon API is wired, because if ABI
+records die with a render session then every addon-held `Texture*` is a use-after-free on
+the first resize, and retrofitting means redoing the API surface. Deciding it (#20):
+
+**An addon-visible `Texture*` and the identifier map live for the process. The GPU view
+inside the record is replaceable.**
+
+The evidence settles what would otherwise be a judgement call. `GpuTexture` owns an
+`ID3D11ShaderResourceView` (`nexus-textures/src/backend.rs:82-85`) and `TextureService::new`
+takes the `GpuBackend` at construction (`service.rs:332`). An SRV is created from the
+**device**, not from the swap chain — so a back-buffer resize or a render-target rebuild does
+**not** invalidate it. Only genuine device loss (`DEVICE_REMOVED`/`DEVICE_RESET`, yielding a
+new device) does.
+
+That has a direct consequence: retiring the texture service on session re-attach is a
+**defect, not a necessity**. Today `RuntimeTextureCoordinator::attach_service`
+(`nexus-runtime/src/textures.rs:181-205`) replaces the active session and `retire_session`
+drops the previous `TextureService`, taking `RegistryState.registry` — and therefore every
+`Arc<TextureEntry>` and every `Box<TextureStorage>` an addon holds a pointer into — with it.
+The reference frees none of this: records are process-lifetime allocations owned by one
+host-wide registry, and neither a resize nor a rebuild clears the identifier map
+(`src/Graphics/Textures/TxLoader.cpp:48-63,137-183`).
+
+Required shape:
+
+| Concern | Lifetime |
+|---|---|
+| `TextureStorage` — the record whose address an addon caches | **Process.** Its address must never change and it must never be freed |
+| The identifier → handle map | **Process.** A resize must not make `Textures_Get` miss for an identifier that resolved before |
+| The `ID3D11ShaderResourceView` | **Per device.** Retained across resize; re-uploaded on device loss, writing the new address into the *existing* record |
+| Decode/download workers and queues | **Per session.** These legitimately belong to the service |
+
+`TextureHandle` is already `Arc<TextureEntry>` and `as_abi_ptr` already documents the
+pointer as valid "while this handle or its registry entry lives", so the record's stability
+is in place; what is missing is an owner outside the session keeping handles alive. Retention
+is therefore **unbounded by design**, matching the reference, which has no ceiling and frees
+no record — see #48 on host-invented ceilings.
+
+Implementation is a separate checkpoint. This entry exists so the wiring is not started
+against the wrong lifetime.
+
 ### 2.5 Brand identity is removed; protocol identifiers are not
 
 **Decision: no third-party brand identity ships in this artifact.** We reimplement the
@@ -431,7 +474,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 | 17 | ● | partial | No raw `((000xxx))` tokens; 11 locale files written at startup | `LoclApi.cpp:29-405` | Reader matches and is wired; **nothing writes any `*_Main.json`**. Asset gap: the identifier numbers are interface and must be preserved |
 | 18 | ● | unreachable | Saved `ImGuiStyle` applied; DPI scaling works | `UiStyle.cpp:49-210`, `Scaling.cpp:59-155` | `style.rs:302-392` complete, zero production callers; `scaling.rs:140-159` correct and unit-tested, **no production caller**; no `GetDpiForWindow`/`WM_DPICHANGED` anywhere (verified). Visible to any user on a 125%/150% display |
 | 19 | ● | unreachable | `AddonConfig.json` read at startup, rewritten on change | `CfgManager.cpp:20-248` | Format matches byte-for-byte with a golden test; **no construction site** and no `PathKey` |
-| 20 | ● | diverges | An addon-held `Texture*` survives resize/fullscreen/device loss | Process-lifetime records; resize never frees them | `textures.rs:180-205,296-315` retires the service and every ABI record on re-attach. **Settle this before wiring the addon API, not after** — otherwise every addon-held pointer is a use-after-free on first resize |
+| 20 | ● | diverges | Texture API: NULL-on-first-miss polling, and a `Texture*` that stays dereferenceable for the process lifetime across resize, fullscreen toggle and device loss | Records are process-lifetime allocations owned by one host-wide registry; neither a resize nor a rebuild frees them or clears the identifier map (`TxLoader.cpp:48-63,137-183`) | **Lifetime now decided — see §2.6.** An SRV is device-scoped, not swap-chain-scoped, so retiring the service on re-attach (`textures.rs:181-205`) is a defect rather than a necessity. Implementation outstanding. Also still to fix: `service.rs:668-694` queues a cached hit instead of dispatching inline, and the caps sit below what C++ accepted |
 | 21 | ● | unreachable | Self-update, per-addon auto-update, library install, patch mutex | `Updater.cpp:19-318`, `Addon.cpp:588-1309` | Every `update.rs` public fn has zero callers outside the file. Zero hits for `RCGG-Mutex` (verified). No cadence, no scheduler, no library source. The mutex must land in the **same change** as the updater |
 | 22 | ● | partial | ~~`VERSIONINFO`~~, third-party notices on disk, a downloadable release | `res/Nexus.rc:56-88` | **`VERSIONINFO` done** — `FileVersion 0.1.0.0`, resource directory 880 bytes, gated by `xtask verify-version` (§4.A2). Still absent: notices list 4 entries against 129 lockfile packages, and there is no tagged, stamped, checksummed release job |
 | 23 | ● | absent | A second GW2 client launches; multibox state logged | `Multibox.cpp:128-188`, substring `AN-Mutex-Window-Guild Wars 2` | Options parsed, never read. No mutex code anywhere. Mainstream GW2 workflow |
