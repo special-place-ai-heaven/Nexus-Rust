@@ -252,11 +252,26 @@ in an ImGui context it was not accepted under. `advance` drains the queue **befo
 frame's atlas rebuild. Detach and shutdown cancel every waiter immediately instead of leaving
 callers blocked to their own deadlines.
 
-Remaining for the bridge: the `RenderFontService` adapter that chooses inline versus queued
-by thread, copies file and Windows-resource bytes into an owned command before queueing, and
-maps these closed errors onto the ABI's return values. The seam and queue carry an explicit
-`dead_code` allowance until then, because installing a partial bridge would hand add-ons a
-null `ImFont*`.
+**The adapter is built, so the bridge is complete.** `RuntimeFontBridge` implements
+`RenderFontService` over all nine operations. It decides inline-versus-queued *before*
+dispatch — a command can only be consumed once, so both paths cannot be attempted with the
+same closure — and collapses both closed error families onto `ServiceRejected`, which is
+sound because every variant is already atomic and the legacy ABI has no error channel for
+these operations.
+
+File and Windows-resource bytes are copied on the calling thread **before** any command is
+queued, so a queued command never retains a path, a borrowed buffer, a module handle or a
+resource pointer, and the queue's byte accounting sees the real payload. All three
+registration sources funnel through one owned-bytes path.
+
+Its test drives the adapter through the trait from both thread contexts — inline on the
+render thread, queued and drained from another — plus a missing font file refused closed and
+every operation rejecting closed once the attachment is gone.
+
+**What remains is installation, not the bridge:** `nexus-runtime` must gain dependency edges
+on the addon crates, construct an `InlineHookService`, and call
+`ProductionAddonApiBackend::compose` with these services. The bridge keeps a `dead_code`
+allowance on its constructor until that call exists.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a

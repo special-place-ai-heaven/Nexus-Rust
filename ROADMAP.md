@@ -136,9 +136,12 @@ wants one owner rather than a fan-out.
 **The install order is now pinned** (`CONFORMANCE.md` §2.9): composition exists, and every
 service `compose` needs is already owned by the runtime **except two** — an
 `InlineHookService` instance (trivial) and an `Arc<dyn RenderFontService>` (the bounded
-synchronous font bridge, `HANDOFF.md:351-535`). The font bridge therefore gates the install,
-and it must land complete: a bridge that rejects `get` hands addons a null `ImFont*` that the
-host pushes unchecked, turning "addons do not load" into "addons load and crash".
+synchronous font bridge, `HANDOFF.md:351-535`).
+
+**The font bridge is now complete** — inline seam, bounded queue and the nine-operation
+adapter, each flip- or thread-tested (`CONFORMANCE.md` §2.9). What remains for the install is
+mechanical: dependency edges on the addon crates, an `InlineHookService`, and one
+`compose` call.
 
 Settle **first**, before writing lifecycle code:
 

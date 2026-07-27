@@ -6,13 +6,16 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use nexus_addon_backend::{
+    BackendOperationError, RenderFontService, RequiredServiceResult, SendFontCallback,
+};
 use nexus_control::{FailureCode, InternalFailure, RenderOperation};
 use nexus_dxgi::RenderCallbackError;
 use nexus_imgui_compat::sys;
@@ -23,7 +26,10 @@ use nexus_ui_fonts::{
     FontCatalogError, FontCatalogHandles, FontRebuildRequest, ImGuiFontManager,
     MAX_USER_FONT_BYTES, SelectedFontHandles, UserFont, UserFontError, new_imgui_font_manager,
 };
-use nexus_ui_services::{OwnerId, UiScale};
+use nexus_ui_services::{
+    FileFontAssetLoader, FontAssetError, FontAssetLoader, FontCallback, FontConfig, FontGetResult,
+    FontRegistration, OwnerId, ResourceFont, SubscriptionId, UiScale,
+};
 use thiserror::Error;
 
 const FONT_SIZE_SETTING: &str = "FontSize";
@@ -770,6 +776,14 @@ impl RuntimeFontCoordinator {
         }
     }
 
+    /// Whether this call is already on the render thread with a live attachment.
+    ///
+    /// Decided before dispatch because a command can only be consumed once, so the inline
+    /// and queued paths cannot both be attempted with the same closure.
+    fn is_render_thread_attached(&self) -> bool {
+        self.active_attachment_on_current_thread().is_some()
+    }
+
     fn active_attachment_on_current_thread(&self) -> Option<u64> {
         let state = mutex_lock(&self.state);
         if state.stopped {
@@ -1008,6 +1022,172 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Add-on-facing font service over the render-thread-local font manager.
+///
+/// Every operation is synchronous from the native API's perspective: a call already on the
+/// render thread executes inline, and a call from any other thread is queued and waited on,
+/// because the manager cannot be reached from another thread at all. See `CONFORMANCE.md`
+/// §2.9.
+///
+/// File and resource bytes are copied on the calling thread **before** any command is
+/// queued, so a queued command never retains a path, a borrowed buffer, a module handle or
+/// a resource pointer.
+pub(crate) struct RuntimeFontBridge {
+    coordinator: Arc<RuntimeFontCoordinator>,
+    limits: FontQueueLimits,
+    timeout: Duration,
+}
+
+impl RuntimeFontBridge {
+    #[allow(
+        dead_code,
+        reason = "installed with the addon API backend, landing next"
+    )]
+    pub(crate) fn new(coordinator: Arc<RuntimeFontCoordinator>) -> Self {
+        Self {
+            coordinator,
+            limits: FontQueueLimits::default(),
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Runs one operation inline or queued, whichever the calling thread allows.
+    ///
+    /// Both closed error families collapse to `ServiceRejected`: the legacy ABI has no
+    /// error channel for these operations, and every variant is already atomic, so no
+    /// partial registration is observable through any of them.
+    fn dispatch<T: Send + 'static>(
+        &self,
+        retained_bytes: usize,
+        operation: impl FnOnce(&mut ImGuiFontManager) -> T + Send + 'static,
+    ) -> RequiredServiceResult<T> {
+        let outcome = if self.coordinator.is_render_thread_attached() {
+            self.coordinator.with_active_manager(operation)
+        } else {
+            self.coordinator.enqueue_for_render_thread(
+                retained_bytes,
+                self.limits,
+                self.timeout,
+                operation,
+            )
+        };
+        outcome.map_err(|_error| BackendOperationError::ServiceRejected)
+    }
+
+    /// Copies asset bytes on this thread, so nothing borrowed reaches a queued command.
+    fn load_asset(
+        load: impl FnOnce(&mut FileFontAssetLoader) -> Result<Vec<u8>, FontAssetError>,
+    ) -> RequiredServiceResult<Vec<u8>> {
+        let mut loader = FileFontAssetLoader;
+        load(&mut loader).map_err(|_error| BackendOperationError::ServiceRejected)
+    }
+}
+
+impl RenderFontService for RuntimeFontBridge {
+    fn get(
+        &self,
+        owner: OwnerId,
+        identifier: String,
+        callback: SendFontCallback,
+    ) -> RequiredServiceResult<FontGetResult> {
+        self.dispatch(0, move |manager| {
+            manager.get(owner, &identifier, callback as FontCallback)
+        })?
+        .map_err(|_error| BackendOperationError::ServiceRejected)
+    }
+
+    fn release(
+        &self,
+        identifier: String,
+        subscription: SubscriptionId,
+    ) -> RequiredServiceResult<bool> {
+        self.dispatch(0, move |manager| manager.release(&identifier, subscription))
+    }
+
+    fn add_from_file(
+        &self,
+        owner: OwnerId,
+        identifier: String,
+        size: f32,
+        filename: PathBuf,
+        callback: Option<SendFontCallback>,
+        config: FontConfig,
+    ) -> RequiredServiceResult<FontRegistration> {
+        let data = Self::load_asset(|loader| loader.load_file(&filename))?;
+        self.add_owned_bytes(owner, identifier, size, data, callback, config)
+    }
+
+    fn add_from_resource(
+        &self,
+        owner: OwnerId,
+        identifier: String,
+        size: f32,
+        resource: ResourceFont,
+        callback: Option<SendFontCallback>,
+        config: FontConfig,
+    ) -> RequiredServiceResult<FontRegistration> {
+        let data = Self::load_asset(|loader| loader.load_resource(resource))?;
+        self.add_owned_bytes(owner, identifier, size, data, callback, config)
+    }
+
+    fn add_from_memory(
+        &self,
+        owner: OwnerId,
+        identifier: String,
+        size: f32,
+        data: Vec<u8>,
+        callback: Option<SendFontCallback>,
+        config: FontConfig,
+    ) -> RequiredServiceResult<FontRegistration> {
+        self.add_owned_bytes(owner, identifier, size, data, callback, config)
+    }
+
+    fn resize(&self, identifier: String, size: f32) -> RequiredServiceResult<bool> {
+        self.dispatch(0, move |manager| manager.resize(&identifier, size))?
+            .map_err(|_error| BackendOperationError::ServiceRejected)
+    }
+
+    fn cleanup_owner(&self, owner: OwnerId) -> RequiredServiceResult<usize> {
+        self.dispatch(0, move |manager| manager.cleanup_owner(owner))
+    }
+
+    fn cleanup_owner_callbacks(&self, owner: OwnerId) -> RequiredServiceResult<usize> {
+        self.dispatch(0, move |manager| manager.cleanup_owner_callbacks(owner))
+    }
+
+    fn cleanup_owner_resources(&self, owner: OwnerId) -> RequiredServiceResult<usize> {
+        self.dispatch(0, move |manager| manager.cleanup_owner_resources(owner))
+    }
+}
+
+impl RuntimeFontBridge {
+    /// The single registration path: all three sources become owned bytes first.
+    fn add_owned_bytes(
+        &self,
+        owner: OwnerId,
+        identifier: String,
+        size: f32,
+        data: Vec<u8>,
+        callback: Option<SendFontCallback>,
+        config: FontConfig,
+    ) -> RequiredServiceResult<FontRegistration> {
+        // The queue accounts for the bytes this command retains, because the manager
+        // copies them again on registration.
+        let retained_bytes = data.len();
+        self.dispatch(retained_bytes, move |manager| {
+            manager.register_memory(
+                owner,
+                &identifier,
+                size,
+                &data,
+                config,
+                callback.map(|callback| callback as FontCallback),
+            )
+        })?
+        .map_err(|_error| BackendOperationError::ServiceRejected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::ptr::NonNull;
@@ -1022,9 +1202,10 @@ mod tests {
     use nexus_ui_services::{FontConfig, OwnerId, UiScale};
 
     use super::{
-        CombinedRenderSessionLease, FONT_SESSIONS, FontAddressCatalog, FontAddresses,
-        FontQueueLimits, FontSessionIdentity, RuntimeFontBridgeError, RuntimeFontCoordinator,
-        contain_font_operation, load_configured_user_font, mutex_lock, validate_user_font_file_len,
+        BackendOperationError, CombinedRenderSessionLease, FONT_SESSIONS, FontAddressCatalog,
+        FontAddresses, FontQueueLimits, FontSessionIdentity, PathBuf, RenderFontService,
+        RuntimeFontBridge, RuntimeFontBridgeError, RuntimeFontCoordinator, contain_font_operation,
+        load_configured_user_font, mutex_lock, validate_user_font_file_len,
         validate_user_font_name,
     };
 
@@ -1199,6 +1380,72 @@ mod tests {
         assert_eq!(
             canceled.join().expect("waiter must not panic"),
             Err(RuntimeFontBridgeError::StaleAttachment)
+        );
+
+        // SAFETY: the session lease dropped all TLS state before destruction.
+        unsafe { sys::igDestroyContext(context.as_ptr()) };
+    }
+
+    /// The add-on-facing adapter must serve the same operation synchronously from either
+    /// thread context: inline on the render thread, queued and drained from anywhere else.
+    #[test]
+    fn the_addon_facing_adapter_serves_both_thread_contexts() {
+        let _guard = context_lock();
+        // SAFETY: this test owns one current context on this thread.
+        let context = unsafe { sys::igCreateContext(core::ptr::null_mut()) };
+        let context = NonNull::new(context).expect("test context");
+        let coordinator = Arc::new(RuntimeFontCoordinator::default());
+        let lease = coordinator
+            .attach_session(identity(1), context)
+            .expect("font session");
+        coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+
+        let bridge = Arc::new(RuntimeFontBridge::new(Arc::clone(&coordinator)));
+
+        // Render thread: executes inline and returns synchronously.
+        assert_eq!(
+            RenderFontService::cleanup_owner_callbacks(&*bridge, OwnerId::new(21, 1)),
+            Ok(0)
+        );
+
+        // Another thread: queued, then served when the render thread drains.
+        let worker = Arc::clone(&bridge);
+        let waiting = std::thread::spawn(move || {
+            RenderFontService::cleanup_owner_resources(&*worker, OwnerId::new(21, 1))
+        });
+        let mut served = None;
+        for _ in 0..200 {
+            coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+            if waiting.is_finished() {
+                served = Some(waiting.join().expect("waiter must not panic"));
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            served.expect("the render thread must serve the queued adapter call"),
+            Ok(0)
+        );
+
+        // A missing font file is refused closed rather than panicking or queueing a path.
+        assert_eq!(
+            RenderFontService::add_from_file(
+                &*bridge,
+                OwnerId::new(21, 1),
+                "absent".to_owned(),
+                16.0,
+                PathBuf::from("does-not-exist.ttf"),
+                None,
+                FontConfig::default(),
+            ),
+            Err(BackendOperationError::ServiceRejected)
+        );
+
+        drop(lease);
+        // With no attachment every operation rejects closed instead of blocking.
+        assert_eq!(
+            RenderFontService::cleanup_owner(&*bridge, OwnerId::new(21, 1)),
+            Err(BackendOperationError::ServiceRejected)
         );
 
         // SAFETY: the session lease dropped all TLS state before destruction.
