@@ -4,7 +4,7 @@ use core::mem::{offset_of, size_of};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use nexus_abi::ReceiveFont;
 use nexus_core::{CallbackGate, OwnerToken};
@@ -95,6 +95,19 @@ pub trait RenderFontService: Send + Sync + 'static {
 
     /// Removes one exact add-on generation and drains its queued manager work.
     fn cleanup_owner(&self, owner: OwnerId) -> RequiredServiceResult<usize>;
+
+    /// Removes only one exact generation's callback subscribers.
+    ///
+    /// This is the pre-drain phase barrier. Font resources must stay available
+    /// to callbacks that are still draining, so implementations must not remove
+    /// font entries or invalidate the atlas here.
+    fn cleanup_owner_callbacks(&self, owner: OwnerId) -> RequiredServiceResult<usize>;
+
+    /// Removes one exact generation's font resources after the gate drained.
+    ///
+    /// This is the post-drain phase barrier. It sweeps entries that only became
+    /// unreferenced during [`Self::cleanup_owner_callbacks`].
+    fn cleanup_owner_resources(&self, owner: OwnerId) -> RequiredServiceResult<usize>;
 }
 
 /// Caller-attributed implementation of the native font ABI.
@@ -146,17 +159,17 @@ impl FontApi {
             return Ok(());
         };
         let key = SubscriptionKey::new(owner.into(), identifier.clone(), callback.address());
-        let subscriptions = mutex_lock(&self.subscriptions)
+        let receipts = mutex_lock(&self.subscriptions)
             .remove(&key)
             .unwrap_or_default();
-        if subscriptions.is_empty() {
+        if receipts.subscriptions.is_empty() {
             return Ok(());
         }
         let Some(_admission) = callback.gate.try_enter() else {
             return Ok(());
         };
         let mut rejected = Vec::new();
-        for subscription in subscriptions {
+        for subscription in receipts.subscriptions {
             if self
                 .service
                 .release(identifier.clone(), subscription)
@@ -171,10 +184,11 @@ impl FontApi {
         if !callback.gate.is_open() {
             return Err(self.service_rejected());
         }
-        mutex_lock(&self.subscriptions)
-            .entry(key)
-            .or_default()
-            .extend(rejected);
+        let mut subscriptions = mutex_lock(&self.subscriptions);
+        let restored = subscriptions.entry(key).or_default();
+        restored.subscriptions.extend(rejected);
+        restored.publication = Some(Arc::downgrade(&callback));
+        drop(subscriptions);
         Err(self.service_rejected())
     }
 
@@ -274,9 +288,58 @@ impl FontApi {
     /// before calling this barrier.
     pub fn cleanup_owner(&self, owner: OwnerToken) -> RequiredServiceResult<usize> {
         let owner_id = OwnerId::from(owner);
-        let removed = self.service_result(self.service.cleanup_owner(owner_id))?;
-        mutex_lock(&self.subscriptions).retain(|key, _| key.owner != owner_id);
-        Ok(removed)
+        self.fence_owner_publications(owner_id);
+        self.service_result(self.service.cleanup_owner(owner_id))
+    }
+
+    /// Fences one exact generation's callbacks while keeping its resources.
+    ///
+    /// Runtime cleanup calls this *before* draining the generation's callback
+    /// gate. Font resources stay registered so callbacks still in flight remain
+    /// valid; [`Self::cleanup_owner_resources`] releases them after the drain.
+    pub fn cleanup_owner_callbacks(&self, owner: OwnerToken) -> RequiredServiceResult<usize> {
+        let owner_id = OwnerId::from(owner);
+        self.fence_owner_publications(owner_id);
+        self.service_result(self.service.cleanup_owner_callbacks(owner_id))
+    }
+
+    /// Releases one exact generation's font resources after the gate drained.
+    ///
+    /// Runtime cleanup calls this *after* [`Self::cleanup_owner_callbacks`] and
+    /// the callback-gate drain.
+    pub fn cleanup_owner_resources(&self, owner: OwnerToken) -> RequiredServiceResult<usize> {
+        let owner_id = OwnerId::from(owner);
+        self.service_result(self.service.cleanup_owner_resources(owner_id))
+    }
+
+    /// Aborts staged publications for one generation and forgets its receipts.
+    ///
+    /// Aborting is what actually fences the generation. Closing admission alone
+    /// only prevents *new* enqueues: work the manager already accepted remains
+    /// dispatchable, so a queued publication could still reach native code
+    /// after the barrier returned. Aborting clears that pending work and latches
+    /// the queue closed.
+    ///
+    /// This runs before any service call, so a rejected service leaves the
+    /// generation fenced rather than half-open. The publication handles are
+    /// collected and the lock released before aborting, because `abort` takes
+    /// each callback's own queue lock.
+    fn fence_owner_publications(&self, owner_id: OwnerId) {
+        let fenced = {
+            let mut subscriptions = mutex_lock(&self.subscriptions);
+            let fenced = subscriptions
+                .iter()
+                .filter(|(key, _)| key.owner == owner_id)
+                .filter_map(|(_, receipts)| receipts.publication.clone())
+                .collect::<Vec<_>>();
+            subscriptions.retain(|key, _| key.owner != owner_id);
+            fenced
+        };
+        for publication in fenced {
+            if let Some(publication) = publication.upgrade() {
+                publication.abort();
+            }
+        }
     }
 
     fn finish_registration(
@@ -310,10 +373,10 @@ impl FontApi {
     ) -> RequiredServiceResult<()> {
         if let Some(subscription) = subscription {
             let key = SubscriptionKey::new(owner.into(), identifier, callback.address());
-            mutex_lock(&self.subscriptions)
-                .entry(key)
-                .or_default()
-                .push(subscription);
+            let mut subscriptions = mutex_lock(&self.subscriptions);
+            let receipts = subscriptions.entry(key).or_default();
+            receipts.subscriptions.push(subscription);
+            receipts.publication = Some(Arc::downgrade(&callback));
         }
         if let Err(error) = self.boundary.validate_current_owner(owner) {
             callback.abort();
@@ -525,7 +588,7 @@ impl fmt::Debug for FontApi {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let subscriptions = mutex_lock(&self.subscriptions)
             .values()
-            .map(Vec::len)
+            .map(|receipts| receipts.subscriptions.len())
             .sum::<usize>();
         formatter
             .debug_struct("FontApi")
@@ -541,7 +604,19 @@ struct SubscriptionKey {
     callback: usize,
 }
 
-type SubscriptionMap = BTreeMap<SubscriptionKey, Vec<SubscriptionId>>;
+/// Retained receipts for one exact `(owner, identifier, callback)` key.
+///
+/// The weak publication handle is what makes callback-phase cleanup able to
+/// *abort* staged work rather than merely stop admitting new work. It is weak
+/// on purpose: the manager's subscriber owns the callback, so cleanup must
+/// never keep a native function pointer reachable past service teardown.
+#[derive(Default, Debug)]
+struct SubscriptionReceipts {
+    subscriptions: Vec<SubscriptionId>,
+    publication: Option<Weak<NativeFontCallback>>,
+}
+
+type SubscriptionMap = BTreeMap<SubscriptionKey, SubscriptionReceipts>;
 
 impl SubscriptionKey {
     fn new(owner: OwnerId, identifier: String, callback: usize) -> Self {
@@ -741,7 +816,7 @@ mod tests {
 
     use super::{
         FontApi, MAX_PENDING_FONT_CALLBACKS, NativeFontCallback, RenderFontService,
-        SendFontCallback, SubscriptionKey,
+        SendFontCallback, SubscriptionKey, SubscriptionReceipts,
     };
     use crate::{
         BackendFailures, BackendOperationError, CallBoundaryError, FontBackend, NativeCallBoundary,
@@ -848,6 +923,8 @@ mod tests {
         resources: Mutex<Vec<ResourceCall>>,
         releases: Mutex<Vec<(String, SubscriptionId)>>,
         cleanups: Mutex<Vec<OwnerId>>,
+        callback_cleanups: Mutex<Vec<OwnerId>>,
+        resource_cleanups: Mutex<Vec<OwnerId>>,
         resizes: Mutex<Vec<(String, f32)>>,
     }
 
@@ -864,6 +941,8 @@ mod tests {
                 resources: Mutex::new(Vec::new()),
                 releases: Mutex::new(Vec::new()),
                 cleanups: Mutex::new(Vec::new()),
+                callback_cleanups: Mutex::new(Vec::new()),
+                resource_cleanups: Mutex::new(Vec::new()),
                 resizes: Mutex::new(Vec::new()),
             }
         }
@@ -993,6 +1072,18 @@ mod tests {
             let removed = lock(&self.callbacks).len();
             lock(&self.callbacks).clear();
             Ok(removed)
+        }
+
+        fn cleanup_owner_callbacks(&self, owner: OwnerId) -> RequiredServiceResult<usize> {
+            lock(&self.callback_cleanups).push(owner);
+            let removed = lock(&self.callbacks).len();
+            lock(&self.callbacks).clear();
+            Ok(removed)
+        }
+
+        fn cleanup_owner_resources(&self, owner: OwnerId) -> RequiredServiceResult<usize> {
+            lock(&self.resource_cleanups).push(owner);
+            Ok(0)
         }
     }
 
@@ -1128,7 +1219,10 @@ mod tests {
         let old_subscription = subscription_tokens(1)[0];
         lock(&harness.api.subscriptions).insert(
             SubscriptionKey::new(OwnerId::from(OWNER), "old-font".to_owned(), 17),
-            vec![old_subscription],
+            SubscriptionReceipts {
+                subscriptions: vec![old_subscription],
+                publication: None,
+            },
         );
 
         assert_eq!(

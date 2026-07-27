@@ -138,14 +138,14 @@ pub const CLEANUP_API_INVENTORY: &[ApiInventoryEntry] = &[
     },
     ApiInventoryEntry {
         service: CleanupService::FontCallbacks,
-        method: "font callback-only exact-owner cleanup",
-        access: ApiAccess::Missing,
-        semantics: ApiSemantics::Unavailable,
-        drop_safety: DropSafety::Unavailable,
+        method: "nexus_ui_services::FontManager::cleanup_owner_callbacks(&mut self, OwnerId) -> usize",
+        access: ApiAccess::Public,
+        semantics: ApiSemantics::ThreadBound,
+        drop_safety: DropSafety::CallerExclusive,
     },
     ApiInventoryEntry {
         service: CleanupService::FontResources,
-        method: "nexus_ui_services::FontManager::cleanup_owner(&mut self, OwnerId) -> usize",
+        method: "nexus_ui_services::FontManager::cleanup_owner_resources(&mut self, OwnerId) -> usize",
         access: ApiAccess::Public,
         semantics: ApiSemantics::ThreadBound,
         drop_safety: DropSafety::CallerExclusive,
@@ -205,10 +205,6 @@ pub const API_GAPS: &[ApiGap] = &[
     ApiGap {
         service: CleanupService::UiHostCallbacks,
         kind: ApiGapKind::CallbackDropUnderLock,
-    },
-    ApiGap {
-        service: CleanupService::FontCallbacks,
-        kind: ApiGapKind::FontPhaseSplitMissing,
     },
     ApiGap {
         service: CleanupService::LocalizationOverrides,

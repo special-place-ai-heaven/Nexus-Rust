@@ -7,9 +7,9 @@
 //! [`crate::TypedAdapter::new`].
 
 use crate::{
-    AdapterError, AdapterFailureKind, CleanupEffect, EventCallbacks, FontResources, InlineHooks,
-    LocalizationOverrides, ManagedInputCallbacks, RawWndProcCallbacks, TextureCallbacks,
-    TypedAdapter, UiHostCallbacks,
+    AdapterError, AdapterFailureKind, CleanupEffect, EventCallbacks, FontCallbacks, FontResources,
+    InlineHooks, LocalizationOverrides, ManagedInputCallbacks, RawWndProcCallbacks,
+    TextureCallbacks, TypedAdapter, UiHostCallbacks,
 };
 use nexus_data_services::EventService;
 use nexus_inline_hooks::InlineHookService;
@@ -93,7 +93,32 @@ pub fn textures(service: Arc<TextureService>) -> TypedAdapter<TextureCallbacks> 
     })
 }
 
+/// Adapts a shared, thread-bound font manager for pre-drain callback cleanup.
+///
+/// This removes only the exact generation's subscribers, so font resources stay
+/// available to callbacks that are still draining. Pair it with
+/// [`font_resources`], which runs after the callback gate has drained.
+///
+/// An outstanding `RefCell` borrow is reported as [`AdapterFailureKind::Busy`]
+/// and can be retried after the borrow ends.
+#[must_use]
+pub fn font_callbacks<B>(service: Rc<RefCell<FontManager<B>>>) -> TypedAdapter<FontCallbacks>
+where
+    B: FontAtlasBackend + 'static,
+{
+    TypedAdapter::new(move |owner| {
+        let mut service = service
+            .try_borrow_mut()
+            .map_err(|_borrowed| AdapterError::new(AdapterFailureKind::Busy))?;
+        let removed = service.cleanup_owner_callbacks(owner.into());
+        Ok(CleanupEffect::complete(removed))
+    })
+}
+
 /// Adapts a shared, thread-bound font manager for post-drain cleanup.
+///
+/// This removes the exact generation's claims and sweeps entries that are now
+/// unreferenced, including entries released by [`font_callbacks`].
 ///
 /// An outstanding `RefCell` borrow is reported as [`AdapterFailureKind::Busy`]
 /// and can be retried after the borrow ends.
@@ -106,7 +131,7 @@ where
         let mut service = service
             .try_borrow_mut()
             .map_err(|_borrowed| AdapterError::new(AdapterFailureKind::Busy))?;
-        let removed = service.cleanup_owner(owner.into());
+        let removed = service.cleanup_owner_resources(owner.into());
         Ok(CleanupEffect::complete(removed))
     })
 }

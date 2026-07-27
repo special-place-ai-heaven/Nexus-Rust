@@ -636,18 +636,36 @@ impl<B: FontAtlasBackend> FontManager<B> {
         removed
     }
 
-    /// Removes registrations and callbacks belonging to an addon generation.
-    pub fn cleanup_owner(&mut self, owner: OwnerId) -> usize {
+    /// Removes only the callback subscribers for one exact addon generation.
+    ///
+    /// This is the pre-drain half of owner cleanup. Font entries stay
+    /// registered and the atlas is deliberately left valid, because resources
+    /// must remain available to in-flight callbacks until
+    /// [`Self::cleanup_owner_resources`] runs after the callback gate drains.
+    pub fn cleanup_owner_callbacks(&mut self, owner: OwnerId) -> usize {
         let mut removed = 0;
         for entry in &mut self.registry {
-            if entry.owner_claims.remove(&owner) {
-                removed += 1;
-            }
             let before = entry.subscribers.len();
             entry
                 .subscribers
                 .retain(|subscriber| subscriber.owner != owner);
             removed += before - entry.subscribers.len();
+        }
+        removed
+    }
+
+    /// Removes exact-generation owner claims and sweeps unreferenced entries.
+    ///
+    /// This is the post-drain half of owner cleanup. The sweep also collects
+    /// entries that only became unreferenced during
+    /// [`Self::cleanup_owner_callbacks`], and the atlas is invalidated only
+    /// when the registry contents actually changed.
+    pub fn cleanup_owner_resources(&mut self, owner: OwnerId) -> usize {
+        let mut removed = 0;
+        for entry in &mut self.registry {
+            if entry.owner_claims.remove(&owner) {
+                removed += 1;
+            }
         }
         let before = self.registry.len();
         self.registry.retain(|entry| !entry.is_unreferenced());
@@ -655,6 +673,14 @@ impl<B: FontAtlasBackend> FontManager<B> {
             self.atlas_built = false;
         }
         removed
+    }
+
+    /// Removes registrations and callbacks belonging to an addon generation.
+    ///
+    /// Retained as the combined legacy barrier: it runs the callback phase
+    /// then the resource phase and returns their summed removal count.
+    pub fn cleanup_owner(&mut self, owner: OwnerId) -> usize {
+        self.cleanup_owner_callbacks(owner) + self.cleanup_owner_resources(owner)
     }
 
     /// Updates a registered font size and schedules an atlas rebuild.
@@ -1033,6 +1059,101 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(manager.cleanup_owner(OwnerId::new(5, 1)), 1);
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn callback_cleanup_keeps_resources_and_the_atlas_until_the_resource_phase() {
+        let owner = OwnerId::new(9, 1);
+        let mut manager = FontManager::new(FakeBackend::default());
+        manager
+            .register_memory(
+                owner,
+                "phased",
+                16.0,
+                b"font",
+                FontConfig::default(),
+                Some(Box::new(|_, _| {})),
+            )
+            .unwrap_or_else(|error| panic!("registration failed: {error}"));
+        manager.atlas_built = true;
+
+        assert_eq!(manager.cleanup_owner_callbacks(owner), 1);
+        assert_eq!(
+            manager.len(),
+            1,
+            "font resources must outlive the callback phase so draining callbacks stay valid"
+        );
+        assert!(
+            manager.atlas_built,
+            "the callback phase must not invalidate the atlas"
+        );
+
+        assert_eq!(
+            manager.cleanup_owner_callbacks(owner),
+            0,
+            "callback cleanup must be idempotent"
+        );
+        assert!(manager.atlas_built);
+
+        assert_eq!(
+            manager.cleanup_owner_resources(owner),
+            0,
+            "a callback-only registration holds no owner claim to remove"
+        );
+        assert!(
+            manager.is_empty(),
+            "the resource phase must sweep entries that the callback phase left unreferenced"
+        );
+        assert!(
+            !manager.atlas_built,
+            "sweeping a real entry must invalidate the atlas"
+        );
+
+        manager.atlas_built = true;
+        assert_eq!(
+            manager.cleanup_owner_resources(owner),
+            0,
+            "resource cleanup must be idempotent and retry-safe"
+        );
+        assert!(
+            manager.atlas_built,
+            "a sweep that changes nothing must not request an atlas rebuild"
+        );
+    }
+
+    #[test]
+    fn cleanup_phases_match_the_exact_generation_and_sum_to_the_legacy_barrier() {
+        let owner = OwnerId::new(9, 1);
+        let newer = OwnerId::new(9, 2);
+        let mut manager = FontManager::new(FakeBackend::default());
+        manager
+            .register_memory(
+                owner,
+                "generation-exact",
+                16.0,
+                b"font",
+                FontConfig::default(),
+                Some(Box::new(|_, _| {})),
+            )
+            .unwrap_or_else(|error| panic!("registration failed: {error}"));
+        manager
+            .register_memory(owner, "claimed", 16.0, b"font", FontConfig::default(), None)
+            .unwrap_or_else(|error| panic!("claim registration failed: {error}"));
+
+        assert_eq!(manager.cleanup_owner_callbacks(newer), 0);
+        assert_eq!(manager.cleanup_owner_resources(newer), 0);
+        assert_eq!(
+            manager.len(),
+            2,
+            "a newer generation of the same signature must not clean the older one"
+        );
+
+        assert_eq!(
+            manager.cleanup_owner(owner),
+            2,
+            "the combined barrier must still report claim and subscriber removals"
+        );
         assert!(manager.is_empty());
     }
 
