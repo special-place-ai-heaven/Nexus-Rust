@@ -328,6 +328,18 @@ native code from disk, so it must happen on the render thread with the API table
 installed, and it must respect the volatile/350-build rule (#8) and the config's
 enabled/disabled state (#19) before loading anything.
 
+**One constraint on the cleaner that is easy to hit and awkward to discover late.**
+`AddonManager` is `Send + Sync`, so its `RegistrationCleaner` must be too — but the typed
+adapters in `nexus-addon-cleanup/src/direct.rs` take `Rc<RefCell<FontManager<B>>>`, which is
+neither. The font manager is render-thread-local, so no `Send` cleaner can hold it directly.
+
+The resolution already exists: build the font cleanup slots over **`RuntimeFontBridge`**
+rather than the raw manager. That is exactly why `cleanup_owner_callbacks` and
+`cleanup_owner_resources` are on `RenderFontService` — the bridge is `Send + Sync` and
+internally routes to the thread-local manager, inline or queued. The same reasoning applies
+to any other cleanup slot whose service is render-thread-local: route it through the
+add-on-facing service, not the underlying one.
+
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a
 half-bridge is worse than no wiring: it converts "addons do not load" into "addons load and
