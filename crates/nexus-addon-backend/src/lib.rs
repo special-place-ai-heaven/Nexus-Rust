@@ -35,7 +35,9 @@ pub use localization::LocalizationApi;
 pub use logging::LoggingApi;
 pub use operation::BackendOperationError;
 pub use paths::{PathApi, StablePathError, StablePathStore};
-pub use production::{CoreAddonApiServices, ProductionAddonApiBackend, RequiredAddonApiServices};
+pub use production::{
+    AddonApiServices, CoreAddonApiServices, ProductionAddonApiBackend, RequiredAddonApiServices,
+};
 pub use services::{
     FontBackend, GameBindBackend, InputBindBackend, LocalizationBackend, RequiredServiceResult,
     TextureBackend, UpdateBackend, WndProcBackend,

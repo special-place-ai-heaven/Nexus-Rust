@@ -150,6 +150,24 @@ pub(crate) struct RuntimeGameInput {
 }
 
 impl RuntimeGameInput {
+    /// Game-bind invoker lifecycle slot handed to the add-on API.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    pub(crate) fn invoker(&self) -> Arc<Mutex<Option<GameInvoker>>> {
+        Arc::clone(&self.invoker)
+    }
+
+    /// Sink delivering one message to the game only, handed to the add-on API.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    pub(crate) fn game_message_sink(&self) -> Arc<Win32GameInput> {
+        Arc::clone(&self.adapter)
+    }
+
     pub(crate) fn load(path: PathBuf) -> (Arc<Self>, Option<PersistenceError>) {
         let adapter = Arc::new(Win32GameInput::new());
         let mut registry = GameBindRegistry::with_defaults();

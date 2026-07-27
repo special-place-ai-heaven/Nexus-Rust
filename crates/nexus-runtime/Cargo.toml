@@ -22,6 +22,7 @@ nexus-data-services.workspace = true
 nexus-dxgi.workspace = true
 nexus-gw2.workspace = true
 nexus-imgui-compat.workspace = true
+nexus-inline-hooks.workspace = true
 nexus-input.workspace = true
 nexus-input-win32.workspace = true
 nexus-network.workspace = true

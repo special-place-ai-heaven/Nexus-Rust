@@ -268,10 +268,23 @@ Its test drives the adapter through the trait from both thread contexts — inli
 render thread, queued and drained from another — plus a missing font file refused closed and
 every operation rejecting closed once the attachment is gone.
 
-**What remains is installation, not the bridge:** `nexus-runtime` must gain dependency edges
-on the addon crates, construct an `InlineHookService`, and call
-`ProductionAddonApiBackend::compose` with these services. The bridge keeps a `dead_code`
-allowance on its constructor until that call exists.
+**The runtime side of the composition is built too.** `RuntimeServices::compose_addon_api`
+supplies all fourteen services from what the runtime already owns: `UiHost`, the log registry,
+a `StablePathStore` built from the live `PathIndex`, a fresh `InlineHookService`, the DataLink
+and Event services (which were previously unread `_data_link`/`_events` fields), the raw
+WndProc registry and managed binds from `input`, the game invoker and message sink from
+`game_input`, the scheduler, the texture coordinator — which already implements
+`TextureServiceFacade` — the localization service, and `RuntimeFontBridge` over the font
+coordinator. Two ownership changes were needed for shared access: the log registry and
+scheduler are now `Arc`.
+
+**What remains is one call.** `install_render_session(generation, swap_chain, imgui_context,
+backend)` must be invoked from the render-session attachment path, which is the only place
+holding a live swap chain and ImGui context, and the returned `InstalledAddonApi` lease must
+be held for that session's lifetime. Loading add-ons additionally needs the `-loader`,
+`-manager`, `-watch` and `-cleanup` crates and a directory scan. Everything up to that call
+now compiles and is covered; the composition path carries a `dead_code` allowance until the
+call exists.
 
 **A partial font bridge must not be installed.** Returning a rejection from `get` hands an
 addon a null `ImFont*`, and the host itself pushes those fonts unchecked (#10), so a

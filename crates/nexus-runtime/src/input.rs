@@ -36,6 +36,24 @@ pub(crate) struct RuntimeInputServices {
 }
 
 impl RuntimeInputServices {
+    /// Managed input-bind registry handed to the add-on API.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    pub(crate) fn managed_binds(&self) -> Arc<ManagedInputBinds> {
+        Arc::clone(&self.managed)
+    }
+
+    /// Raw window-message callback registry handed to the add-on API.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    pub(crate) fn raw_wnd_proc(&self) -> Arc<RawWndProcRegistry> {
+        Arc::clone(&self.raw)
+    }
+
     pub(crate) fn load(
         path: PathBuf,
         ui_host: Arc<UiHost>,

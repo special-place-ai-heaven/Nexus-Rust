@@ -1215,6 +1215,21 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Blocks until exactly `expected` commands are queued.
+    ///
+    /// Spinning a fixed number of `advance` calls and hoping the spawned thread was
+    /// scheduled is a race that fails under parallel test load; the queue length is the
+    /// observable that actually says the command has landed.
+    fn await_queued(coordinator: &RuntimeFontCoordinator, expected: usize) {
+        for _ in 0..100_000 {
+            if mutex_lock(&coordinator.state).queue.len() == expected {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("the command never reached the queue");
+    }
+
     fn identity(value: u64) -> FontSessionIdentity {
         FontSessionIdentity {
             swap_chain_id: SwapChainId::new(value),
@@ -1331,20 +1346,10 @@ mod tests {
             )
         });
 
-        // Drain from the render thread until the waiter is served.
-        let mut served = None;
-        for _ in 0..200 {
-            coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
-            if waiting.is_finished() {
-                served = Some(waiting.join().expect("waiter must not panic"));
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(
-            served.expect("the render thread must serve the queued command"),
-            Ok(0)
-        );
+        // Deterministic: wait for the command to land, drain once, then collect.
+        await_queued(&coordinator, 1);
+        coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+        assert_eq!(waiting.join().expect("waiter must not panic"), Ok(0));
 
         // The byte bound rejects before accepting, so nothing is retained.
         let bounded = FontQueueLimits {
@@ -1369,13 +1374,7 @@ mod tests {
                 |_manager| (),
             )
         });
-        // Give the command time to land in the queue before detaching.
-        for _ in 0..1000 {
-            if mutex_lock(&coordinator.state).queue.len() == 1 {
-                break;
-            }
-            std::thread::yield_now();
-        }
+        await_queued(&coordinator, 1);
         drop(lease);
         assert_eq!(
             canceled.join().expect("waiter must not panic"),
@@ -1413,19 +1412,9 @@ mod tests {
         let waiting = std::thread::spawn(move || {
             RenderFontService::cleanup_owner_resources(&*worker, OwnerId::new(21, 1))
         });
-        let mut served = None;
-        for _ in 0..200 {
-            coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
-            if waiting.is_finished() {
-                served = Some(waiting.join().expect("waiter must not panic"));
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(
-            served.expect("the render thread must serve the queued adapter call"),
-            Ok(0)
-        );
+        await_queued(&coordinator, 1);
+        coordinator.advance(context.as_ptr(), RenderStage::Addons, false, &[]);
+        assert_eq!(waiting.join().expect("waiter must not panic"), Ok(0));
 
         // A missing font file is refused closed rather than panicking or queueing a path.
         assert_eq!(

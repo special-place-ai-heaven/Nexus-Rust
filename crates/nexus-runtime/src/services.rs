@@ -7,6 +7,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use nexus_addon_backend::{
+    AddonApiServices, BackendFailures, NativeCallBoundary, ProductionAddonApiBackend,
+    StablePathError, StablePathStore, TextureServiceFacade,
+};
+use nexus_inline_hooks::InlineHookService;
+
 use nexus_abi::{
     DL_MUMBLE_LINK, DL_MUMBLE_LINK_IDENTITY, EV_MUMBLE_IDENTITY_UPDATED, MumbleData,
     MumbleIdentity, MumbleUiScale,
@@ -42,6 +48,12 @@ use windows_sys::Win32::System::LibraryLoader::{
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::UI::Shell::{CSIDL_PERSONAL, SHGFP_TYPE_CURRENT, SHGetFolderPathW};
 
+#[allow(
+    dead_code,
+    reason = "called by the render-session install, landing next"
+)]
+const MAX_INTERNED_ADDON_PATHS: usize = 4096;
+
 const MAX_EXTENDED_PATH_UNITS: usize = 32_768;
 const SHELL_PATH_UNITS: usize = 260;
 const LOCALIZATION_QUEUE_CAPACITY: usize = 4_096;
@@ -68,11 +80,58 @@ struct RuntimeServices {
     render_observer: Arc<dyn RenderSessionObserver>,
     localization: Arc<RuntimeLocalization>,
     scaling: RuntimeScaling,
-    logger: LogRegistry,
-    scheduler: Option<MinimalScheduler>,
+    logger: Arc<LogRegistry>,
+    scheduler: Option<Arc<MinimalScheduler>>,
 }
 
 impl RuntimeServices {
+    /// Builds the add-on API backend from the services this runtime owns.
+    ///
+    /// This is the runtime half of the wiring register #1 tracks: before it existed nothing
+    /// proved the runtime could supply every service the native API needs. Composition is
+    /// separate from installation on purpose — `install_render_session` needs a live swap
+    /// chain and ImGui context, which only the render-session attachment path has.
+    ///
+    /// The path store's interning ceiling is advisory, so a name past it still resolves
+    /// rather than handing an add-on a null pointer to concatenate.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    fn compose_addon_api(
+        &self,
+        paths: &PathIndex,
+        boundary: Arc<NativeCallBoundary>,
+        failures: Arc<BackendFailures>,
+    ) -> Result<ProductionAddonApiBackend, StablePathError> {
+        let store = Arc::new(StablePathStore::from_index(
+            paths,
+            MAX_INTERNED_ADDON_PATHS,
+        )?);
+        Ok(ProductionAddonApiBackend::compose(
+            boundary,
+            failures,
+            AddonApiServices {
+                ui_host: Arc::clone(&self.ui_host),
+                logs: Arc::clone(&self.logger),
+                paths: store,
+                inline_hooks: Arc::new(InlineHookService::new()),
+                data_link: Arc::clone(&self._data_link),
+                events: Arc::clone(&self._events),
+                wnd_proc_callbacks: self.input.raw_wnd_proc(),
+                game_messages: self.game_input.game_message_sink(),
+                input_binds: self.input.managed_binds(),
+                game_invoker: self.game_input.invoker(),
+                game_scheduler: self.scheduler.clone(),
+                textures: Arc::clone(&self.textures) as Arc<dyn TextureServiceFacade>,
+                localization: self.localization.service(),
+                fonts: Arc::new(crate::fonts::RuntimeFontBridge::new(Arc::clone(
+                    &self.fonts,
+                ))),
+            },
+        ))
+    }
+
     fn build() -> Result<Self, ServiceInitError> {
         let roots = PathRoots::new(
             current_module_path()?,
@@ -93,7 +152,7 @@ impl RuntimeServices {
             }
         });
 
-        let logger = LogRegistry::new();
+        let logger = Arc::new(LogRegistry::new());
         match FileLogSink::create(paths.get(PathKey::Log), LogLevel::All) {
             Ok(sink) => {
                 let _ = logger.register(Arc::new(sink));
@@ -102,7 +161,7 @@ impl RuntimeServices {
         }
 
         let scheduler = match MinimalScheduler::new() {
-            Ok(scheduler) => Some(scheduler),
+            Ok(scheduler) => Some(Arc::new(scheduler)),
             Err(error) => {
                 crate::diagnostics::report_proxy_failure(&error);
                 None
@@ -118,7 +177,7 @@ impl RuntimeServices {
                 None
             }
         };
-        let mumble = initialize_mumble(&data_link, &events, scheduler.as_ref());
+        let mumble = initialize_mumble(&data_link, &events, scheduler.as_deref());
         let ui_host = ui_host();
         let fonts = crate::fonts::RuntimeFontCoordinator::load(
             settings.as_ref(),
@@ -224,6 +283,15 @@ impl Default for LocalizationFrame {
 }
 
 impl RuntimeLocalization {
+    /// Localization service handed to the add-on API.
+    #[allow(
+        dead_code,
+        reason = "called by the render-session install, landing next"
+    )]
+    fn service(&self) -> Arc<Mutex<LocalizationService>> {
+        Arc::clone(&self.service)
+    }
+
     fn new(service: LocalizationService) -> Self {
         let texts = localization_texts(&service);
         Self {

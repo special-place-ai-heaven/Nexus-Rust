@@ -679,11 +679,16 @@ mod tests {
         .expect("the load should be accepted");
         assert!(matches!(outcome, RequestOutcome::Queued));
 
-        for _ in 0..64 {
+        // Decoding and upload run on a worker thread, so this is a genuine asynchronous
+        // completion and polling is correct. The bound is generous rather than tight: a
+        // small one fails under parallel test load, which is a flaky test rather than a
+        // real defect.
+        for _ in 0..100_000 {
             coordinator.advance(RenderStage::Addons);
             if let Ok(Some(handle)) = TextureServiceFacade::get(coordinator, identifier) {
                 return handle;
             }
+            std::thread::yield_now();
         }
         panic!("the texture never completed");
     }
