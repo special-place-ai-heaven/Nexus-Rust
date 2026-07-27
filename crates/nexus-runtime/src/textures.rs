@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -68,6 +69,22 @@ enum TextureAttachError {
 struct CoordinatorState {
     next_attachment_id: u64,
     active: Option<Arc<ActiveTextureSession>>,
+    /// Every texture record ever handed out, kept alive for the process.
+    ///
+    /// An add-on caches the `Texture*` it receives and dereferences it for the rest of
+    /// the session, so the record behind it may never be freed and its identifier must
+    /// keep resolving. Retiring a render session drops that session's `TextureService`
+    /// and with it the service-side registry, so without this table the pointer an
+    /// add-on holds would dangle on the first resize. See `CONFORMANCE.md` §2.6.
+    ///
+    /// The shader-resource view inside each record is created from the *device*, not the
+    /// swap chain, so it stays valid across a resize or a render-target rebuild and the
+    /// retained handle remains fully usable. Device loss is the separate case that must
+    /// re-upload into the existing record.
+    ///
+    /// Growth is unbounded by design: the reference imposes no ceiling and frees no
+    /// record.
+    retained: HashMap<Arc<str>, TextureHandle>,
 }
 
 struct SessionLifecycle {
@@ -299,6 +316,27 @@ impl RuntimeTextureCoordinator {
         retire_session(active);
     }
 
+    /// Keeps one record alive for the process, so an add-on-held `Texture*` cannot dangle.
+    ///
+    /// The first handle seen for an identifier wins. Replacing it would move the record an
+    /// add-on already cached, which is the very thing this table exists to prevent.
+    fn retain(&self, identifier: &str, handle: &TextureHandle) {
+        let mut state = mutex_lock(&self.state);
+        if !state.retained.contains_key(identifier) {
+            state.retained.insert(Arc::from(identifier), handle.clone());
+        }
+    }
+
+    fn retained(&self, identifier: &str) -> Option<TextureHandle> {
+        mutex_lock(&self.state).retained.get(identifier).cloned()
+    }
+
+    /// Number of records held for the process. Diagnostics only.
+    #[cfg(test)]
+    fn retained_count(&self) -> usize {
+        mutex_lock(&self.state).retained.len()
+    }
+
     fn detach(&self, attachment_id: u64) {
         let active = {
             let mut state = mutex_lock(&self.state);
@@ -313,10 +351,17 @@ impl RuntimeTextureCoordinator {
 
 impl TextureServiceFacade for RuntimeTextureCoordinator {
     fn get(&self, identifier: &str) -> Result<Option<TextureHandle>, TextureFacadeError> {
-        let operation = self
-            .acquire()
-            .map_err(|_error| TextureFacadeError::Rejected)?;
-        TextureServiceFacade::get(&operation.session.service, identifier)
+        // The registry is host-wide in the reference, so a record that resolved once keeps
+        // resolving even after the session that created it has been retired.
+        let from_session = match self.acquire() {
+            Ok(operation) => TextureServiceFacade::get(&operation.session.service, identifier)?,
+            Err(_error) => None,
+        };
+        if let Some(handle) = from_session {
+            self.retain(identifier, &handle);
+            return Ok(Some(handle));
+        }
+        Ok(self.retained(identifier))
     }
 
     fn load_with_source(
@@ -330,14 +375,18 @@ impl TextureServiceFacade for RuntimeTextureCoordinator {
         let operation = self
             .acquire()
             .map_err(|_error| TextureFacadeError::Rejected)?;
-        TextureServiceFacade::load_with_source(
+        let outcome = TextureServiceFacade::load_with_source(
             &operation.session.service,
             identifier,
             options,
             callback,
             source,
             failure_policy,
-        )
+        )?;
+        if let RequestOutcome::Cached(handle) = &outcome {
+            self.retain(identifier, handle);
+        }
+        Ok(outcome)
     }
 
     fn cleanup_owner_generation(
@@ -536,7 +585,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use nexus_textures::{
-        DecodedImage, GpuBackend, GpuTexture, NoDownloader, NoOverrides, NoResources,
+        DecodeLimits, DecodedImage, GpuBackend, GpuTexture, ImageDecoder, NoDownloader,
+        NoOverrides, NoResources,
     };
 
     use super::*;
@@ -583,6 +633,104 @@ mod tests {
             Arc::new(NoResources),
         )
         .expect("offline test texture service should start")
+    }
+
+    /// Always yields one opaque pixel, so a load completes without real image bytes.
+    struct StubDecoder;
+
+    impl ImageDecoder for StubDecoder {
+        fn decode(
+            &self,
+            _encoded: &[u8],
+            _limits: DecodeLimits,
+        ) -> Result<DecodedImage, BackendFailure> {
+            Ok(DecodedImage {
+                width: 1,
+                height: 1,
+                rgba8: vec![u8::MAX; 4],
+            })
+        }
+    }
+
+    fn decoding_service(drops: &Arc<AtomicUsize>) -> TextureService {
+        TextureService::new(
+            TextureConfig::default(),
+            Arc::new(StubDecoder),
+            Arc::new(TestGpu {
+                drops: Arc::clone(drops),
+            }),
+            Arc::new(NoDownloader),
+            Arc::new(NoOverrides),
+            Arc::new(NoResources),
+        )
+        .expect("offline test texture service should start")
+    }
+
+    /// Registers one texture and returns its handle, driving the load to completion.
+    fn register(coordinator: &RuntimeTextureCoordinator, identifier: &str) -> TextureHandle {
+        let outcome = TextureServiceFacade::load_with_source(
+            coordinator,
+            identifier,
+            LoadOptions::default(),
+            None,
+            Box::new(|| Ok(TextureSource::Memory(vec![1]))),
+            TextureSourceFailurePolicy::Suppress,
+        )
+        .expect("the load should be accepted");
+        assert!(matches!(outcome, RequestOutcome::Queued));
+
+        for _ in 0..64 {
+            coordinator.advance(RenderStage::Addons);
+            if let Ok(Some(handle)) = TextureServiceFacade::get(coordinator, identifier) {
+                return handle;
+            }
+        }
+        panic!("the texture never completed");
+    }
+
+    /// An add-on caches the `Texture*` it is handed and dereferences it for the whole
+    /// session. A resize retires the render session and drops that session's
+    /// `TextureService`, so without process-scoped retention the pointer would dangle and
+    /// the identifier would stop resolving. See `CONFORMANCE.md` §2.6.
+    #[test]
+    fn an_addon_held_texture_survives_a_session_reattach() {
+        let coordinator = Arc::new(RuntimeTextureCoordinator::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = coordinator
+            .attach_service(identity(1, 1), decoding_service(&drops))
+            .expect("first service should attach");
+
+        let handle = register(&coordinator, "icon");
+        let addon_pointer = handle.as_abi_ptr();
+
+        // A surface-affecting change advances the generation and re-attaches, which
+        // retires the previous service exactly as a resize does.
+        drop(first);
+        let _second = coordinator
+            .attach_service(identity(1, 2), decoding_service(&drops))
+            .expect("second service should attach");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the first session's GPU backend must have been dropped, so this is a real              re-attach and not a no-op"
+        );
+
+        let after = TextureServiceFacade::get(&*coordinator, "icon")
+            .expect("the lookup must not be rejected")
+            .expect("the identifier must still resolve after a re-attach");
+        assert!(
+            after.ptr_eq(&handle),
+            "the same registry allocation must be returned"
+        );
+        assert_eq!(
+            after.as_abi_ptr(),
+            addon_pointer,
+            "the address an add-on cached must not move"
+        );
+        // The retained handle keeps the record alive on its own.
+        drop(handle);
+        assert_eq!(after.width(), 1);
+        assert_eq!(coordinator.retained_count(), 1);
     }
 
     fn identity(sequence: u64, generation: u64) -> TextureSessionIdentity {

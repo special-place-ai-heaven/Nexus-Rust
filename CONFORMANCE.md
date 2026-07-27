@@ -152,8 +152,21 @@ is in place; what is missing is an owner outside the session keeping handles ali
 is therefore **unbounded by design**, matching the reference, which has no ceiling and frees
 no record — see #48 on host-invented ceilings.
 
-Implementation is a separate checkpoint. This entry exists so the wiring is not started
-against the wrong lifetime.
+**Implemented for the resize case.** `RuntimeTextureCoordinator` now holds a process-scoped
+`retained` table keyed by identifier. Every handle it hands out is kept alive there, and a
+`get` that misses the current session falls back to it, so a record that resolved once keeps
+resolving after the session that created it is retired. The first handle seen for an
+identifier wins — replacing it would move a record an add-on already cached, which is the
+thing the table exists to prevent.
+
+Flip-tested: removing only the retention makes the test fail with *"the identifier must still
+resolve after a re-attach"*, with the run count identical across both worlds, so the
+counterfactual moved the subject and not the instrument.
+
+**Still outstanding: device loss.** On `DEVICE_REMOVED`/`DEVICE_RESET` the retained SRV
+becomes invalid and must be re-uploaded into the *existing* record rather than replaced. The
+retained handle would currently hand an add-on a stale view. Resize, fullscreen toggle and
+render-target rebuild are covered because those keep the device.
 
 ### 2.5 Brand identity is removed; protocol identifiers are not
 
@@ -474,7 +487,7 @@ Counts across 225 surveyed items: 52 `matches`, 43 `partial`, 43 `diverges`, 55 
 | 17 | ● | partial | No raw `((000xxx))` tokens; 11 locale files written at startup | `LoclApi.cpp:29-405` | Reader matches and is wired; **nothing writes any `*_Main.json`**. Asset gap: the identifier numbers are interface and must be preserved |
 | 18 | ● | unreachable | Saved `ImGuiStyle` applied; DPI scaling works | `UiStyle.cpp:49-210`, `Scaling.cpp:59-155` | `style.rs:302-392` complete, zero production callers; `scaling.rs:140-159` correct and unit-tested, **no production caller**; no `GetDpiForWindow`/`WM_DPICHANGED` anywhere (verified). Visible to any user on a 125%/150% display |
 | 19 | ● | unreachable | `AddonConfig.json` read at startup, rewritten on change | `CfgManager.cpp:20-248` | Format matches byte-for-byte with a golden test; **no construction site** and no `PathKey` |
-| 20 | ● | diverges | Texture API: NULL-on-first-miss polling, and a `Texture*` that stays dereferenceable for the process lifetime across resize, fullscreen toggle and device loss | Records are process-lifetime allocations owned by one host-wide registry; neither a resize nor a rebuild frees them or clears the identifier map (`TxLoader.cpp:48-63,137-183`) | **Lifetime now decided — see §2.6.** An SRV is device-scoped, not swap-chain-scoped, so retiring the service on re-attach (`textures.rs:181-205`) is a defect rather than a necessity. Implementation outstanding. Also still to fix: `service.rs:668-694` queues a cached hit instead of dispatching inline, and the caps sit below what C++ accepted |
+| 20 | ● | diverges | Texture API: NULL-on-first-miss polling, and a `Texture*` that stays dereferenceable for the process lifetime across resize, fullscreen toggle and device loss | Records are process-lifetime allocations owned by one host-wide registry; neither a resize nor a rebuild frees them or clears the identifier map (`TxLoader.cpp:48-63,137-183`) | **Lifetime now decided — see §2.6.** An SRV is device-scoped, not swap-chain-scoped, so retiring the service on re-attach was a defect rather than a necessity. **Process-scoped retention now implemented and flip-tested** (§2.6); device-loss re-upload is still outstanding. Also still to fix: `service.rs:668-694` queues a cached hit instead of dispatching inline, and the caps sit below what C++ accepted |
 | 21 | ● | unreachable | Self-update, per-addon auto-update, library install, patch mutex | `Updater.cpp:19-318`, `Addon.cpp:588-1309` | Every `update.rs` public fn has zero callers outside the file. Zero hits for `RCGG-Mutex` (verified). No cadence, no scheduler, no library source. The mutex must land in the **same change** as the updater |
 | 22 | ● | partial | ~~`VERSIONINFO`~~, third-party notices on disk, a downloadable release | `res/Nexus.rc:56-88` | **`VERSIONINFO` done** — `FileVersion 0.1.0.0`, resource directory 880 bytes, gated by `xtask verify-version` (§4.A2). Still absent: notices list 4 entries against 129 lockfile packages, and there is no tagged, stamped, checksummed release job |
 | 23 | ● | absent | A second GW2 client launches; multibox state logged | `Multibox.cpp:128-188`, substring `AN-Mutex-Window-Guild Wars 2` | Options parsed, never read. No mutex code anywhere. Mainstream GW2 workflow |
